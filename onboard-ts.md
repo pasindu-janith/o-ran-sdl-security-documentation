@@ -1,11 +1,3 @@
----
-title: "Traffic Steering (TS) xApp Onboarding Guide"
-author: "Pasindu Janith"
-project: "O-RAN Near-RT RIC Testbed"
-version: "1.0"
-date: "2026-03-08"
----
-
 # Traffic Steering (TS) xApp Onboarding
 
 ## 1. Introduction

@@ -1,12 +1,3 @@
----
-title: "Secure xApp Onboarding Documentation"
-author: "Pasindu Janith"
-project: "O-RAN Near-RT RIC Testbed with srsRAN"
-date: 2026-03-01
-version: 1.0
-keywords: [O-RAN, RIC, xApp, DMS CLI, Helm, Kubernetes, SMO]
----
-
 # xApp Onboarding in Near-RT RIC
 
 ## 1. Introduction
