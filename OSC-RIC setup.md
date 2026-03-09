@@ -1,11 +1,3 @@
----
-title: "Near-RT RIC Installation in RIC Cluster"
-author: "Pasindu Janith"
-project: "O-RAN Near-RT RIC Testbed"
-version: "1.0"
-date: "2026-03-08"
----
-
 # Near-Real-Time RIC Installation Guide
 
 This document describes the installation procedure for the **Near Real-Time RAN Intelligent Controller (Near-RT RIC)** in a Kubernetes cluster based on the O-RAN Software Community deployment guides.
