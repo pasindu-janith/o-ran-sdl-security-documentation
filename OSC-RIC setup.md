@@ -344,14 +344,103 @@ This removes all Helm deployments and Kubernetes resources.
 cu.yml
 
 ```bash
+# Example config for a locally deployed CU listening on the localhost interface for a DU connection
 
+cu_cp:
+  amf:
+    addr: 10.53.1.2                     # The address or hostname of the AMF.
+    port: 38412
+    bind_addr: 10.53.1.1                 # A local IP that the gNB binds to for traffic from the AMF.
+    supported_tracking_areas:             # Configure the TA associated with the CU-CP
+      - tac: 7
+        plmn_list:
+          - plmn: "00101"
+            tai_slice_support_list:
+              - sst: 1
+  f1ap:
+    bind_addr: 127.0.10.1                 # Configure the F1AP bind address, this will enable the CU-cp to connect to the DU
+
+cu_up:
+  f1u:
+    socket:                               # Define UDP/IP socket(s) for F1-U interface.
+      -                                     # Socket 1
+        bind_addr: 127.0.20.1                  # Sets the address that the F1-U socket will bind to.
+
+e2:
+  enable_cu_cp_e2: true    # Enable agent for Control Plane
+  enable_cu_up_e2: true    # Enable agent for User Plane
+  addr: 192.168.1.134      # Connect to the RIC on this machine
+  bind_addr: 10.53.1.1
+  port: 32222             # Port shown in your docker ps output
+
+log:
+  filename: /tmp/cu.log
+  all_level: warning
+
+pcap:
+  ngap_enable: false
+  ngap_filename: /tmp/cu_ngap.pcap
 
 ```
 
 du.yml
 
 ```bash
+f1ap:
+  cu_cp_addr: 127.0.10.1        # CU-CP F1-C address
+  bind_addr: 127.0.10.2         # DU local F1-C bind address
 
+
+f1u:
+  socket:
+    - bind_addr: 127.0.10.2     # DU F1-U bind address
+
+
+ru_sdr:
+  device_driver: zmq
+  device_args: tx_port=tcp://127.0.0.1:2000,rx_port=tcp://127.0.0.1:2001,base_srate=23.04e6
+  srate: 23.04
+  tx_gain: 80
+  rx_gain: 40
+
+e2:
+  enable_du_e2: true       # Enable agent for the DU
+  addr: 192.168.1.134
+  bind_addr: 10.53.1.1
+  port: 32222
+
+
+cell_cfg:
+  dl_arfcn: 368500                  # ARFCN of the downlink carrier (center frequency).
+  band: 3                           # The NR band.
+  channel_bandwidth_MHz: 20         # Bandwith in MHz. Number of PRBs will be automatically derived.
+  common_scs: 15                    # Subcarrier spacing in kHz used for data.
+  plmn: "00101"                     # PLMN broadcasted by the gNB.
+  tac: 7                            # Tracking area code (needs to match the core configuration).
+  pdcch:
+    common:
+      ss0_index: 0                  # Set search space zero index to match srsUE capabilities
+      coreset0_index: 12            # Set search CORESET Zero index to match srsUE capabilities
+    dedicated:
+      ss2_type: common              # Search Space type, has to be set to common
+      dci_format_0_1_and_1_1: false # Set correct DCI format (fallback)
+  prach:
+    prach_config_index: 1           # Sets PRACH config to match what is expected by srsUE
+  pdsch:
+    mcs_table: qam64                # Sets PDSCH MCS to 64 QAM
+  pusch:
+    mcs_table: qam64                # Sets PUSCH MCS to 64 QAM
+
+pcap:
+  e2ap_enable: true                              # Set to true to enable E2AP PCAPs.
+  e2ap_du_filename: /tmp/gnb_du_e2ap.pcap        # Path where the DU E2AP PCAP is stored.
+
+metrics:
+  layers:
+    enable_rlc: true                # Enable RLC metrics
+    enable_sched: true              # Enable DU scheduler metrics
+  periodicity:
+    du_report_period: 1000          # Set DU statistics report period to 1s
 
 ```
 
