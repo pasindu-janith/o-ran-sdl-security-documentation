@@ -1,10 +1,62 @@
-# Test OPA in RIC Cluster
+# Deploy OPA (Open Policy Agent)
+OPA is used as the Policy Decision Point(PDP).
 
-Port forwarding for test OPA using REST API HTTP Request:
+opa-deployment.yaml
 
 ```bash
-sudo kubectl port-forward deployment/opa-pdp 8181:8181 -n ricplt
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opa-pdp
+  namespace: ricplt
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: opa-pdp
+  template:
+    metadata:
+      labels:
+        app: opa-pdp
+    spec:
+      containers:
+      - name: opa
+        image: openpolicyagent/opa:latest-envoy
+        args:
+        - "run"
+        - "--server"
+        - "--addr=0.0.0.0:8181"
+        - "--diagnostic-addr=0.0.0.0:8282"
+        - "--set=plugins.envoy_ext_authz_grpc.addr=:9191"
+        - "--set=plugins.envoy_ext_authz_grpc.path=envoy/authz/allow"
+        - "--set=decision_logs.console=true"
+        - "/config/policy.rego"
+        ports:
+        - containerPort: 9191
+          name: grpc
+        volumeMounts:
+        - name: opa-policy-vol
+          mountPath: /config
+      volumes:
+      - name: opa-policy-vol
+        configMap:
+          name: opa-policy
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opa-service
+  namespace: ricplt
+spec:
+  selector:
+    app: opa-pdp
+  ports:
+  - name: grpc
+    port: 9191
+    targetPort: 9191
+
 ```
+
 opa-policy.yaml includes the PDP policies
 ```bash
 apiVersion: v1
@@ -44,6 +96,20 @@ data:
     }
     
 ```
+
+Run this command to apply this in RIC cluster.
+```bash
+kubectl apply -f opa-policy.yaml -f opa-deployment.yaml
+```
+
+# Test OPA in RIC Cluster
+
+Port forwarding for test OPA using REST API HTTP Request:
+
+```bash
+sudo kubectl port-forward deployment/opa-pdp 8181:8181 -n ricplt
+```
+
 Once perform any change in opa-policy.yaml logics, apply it to RIC cluster for configMap
 
 ```bash
