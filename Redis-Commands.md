@@ -2,7 +2,7 @@
 
 Login to the DBAAS container
 ```bash
-kubectl exec -it <your-dbaas-pod-name> -n ricplt -- /bin/sh
+sudo kubectl exec -it statefulset-ricplt-dbaas-server-0 -n ricplt -- redis-cli
 ```
 
 Run the Redis Monitor Command:
