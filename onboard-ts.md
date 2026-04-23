@@ -150,7 +150,7 @@ Modify the image registry and tag:
 Run the DMS CLI onboarding command.
 
 ```bash
-dms_cli onboard --config_file_path=config-file.json --shcema_file_path=schema.json
+sudo CHART_REPO_URL=http://0.0.0.0:8090 dms_cli onboard --config_file_path=config-file.json --schema_file_path=schema.json
 ```
 
 Expected output:

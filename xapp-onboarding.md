@@ -203,9 +203,7 @@ dms_cli rollback \
 ## 5.8 Uninstall xApp
 
 ```bash
-dms_cli uninstall \
-  --xapp_chart_name=kpimon \
-  --namespace=ricxapp
+dms_cli uninstall --xapp_chart_name=kpimon --namespace=ricxapp
 ```
 
 ---
