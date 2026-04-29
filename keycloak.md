@@ -98,13 +98,133 @@ kubectl get secrets -n keycloak
 
 # 2. Deploying Keycloak in Kubernetes
 Keycloak is deployed as a standard Kubernetes Deployment in its own namespace alongside the RIC platform. For development and research purposes, Keycloak runs in dev mode using an embedded H2 database. This means realm and client configuration will be lost if the pod is restarted. For production, replace the H2 database with PostgreSQL backed by a persistent volume.
+⚠  WARNING
+Keycloak previously ran in start-dev mode with an embedded H2 in-memory database, causing all realm and client configuration to be lost on every pod restart or VM reboot. This section replaces that setup with a PostgreSQL-backed deployment. Realm configuration now survives indefinitely.
+
 
 # 2.1 Create the Keycloak Namespace
 ```bash
 kubectl create namespace keycloak
 ```
+# 2.2 Create the Database Credentials Secret
+Store PostgreSQL credentials as a Kubernetes secret so they are never hardcoded in the deployment manifest.
+```bash
+kubectl create secret generic keycloak-db-secret \
+  --from-literal=POSTGRES_USER=keycloak \
+  --from-literal=POSTGRES_PASSWORD=keycloak123 \
+  --from-literal=POSTGRES_DB=keycloak \
+  -n keycloak
 
-# 2.2 Deployment Manifest
+```
+# 2.3 Install Local Storage Provisioner
+A bare-metal Kubernetes cluster has no StorageClass by default, which prevents PersistentVolumeClaims from binding. Install the local-path-provisioner — the same storage backend used by K3s — to enable persistent volumes on a single-node cluster
+```bash
+kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/deploy/local-path-storage.yaml
+```
+Wait for the provisioner to be ready
+```bash
+kubectl rollout status deployment/local-path-provisioner -n local-path-storage
+```
+Verify the storage class is now available:
+```bash
+kubectl get storageclass
+```
+Expected output:
+```bash
+NAME         PROVISIONER             RECLAIMPOLICY   VOLUMEBINDINGMODE
+local-path   rancher.io/local-path   Delete          WaitForFirstConsumer
+```
+
+# 2.4 PostgreSQL Deployment Manifest
+Create the deployment file:
+```bash
+nano ~/postgres-deployment.yaml 
+```
+
+```bash
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      containers:
+      - name: keycloak
+        image: quay.io/keycloak/keycloak:latest
+        args: ["start-dev", "--https-client-auth=request"]
+        env:
+        - name: KC_BOOTSTRAP_ADMIN_USERNAME
+          value: "admin"
+        - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+          value: "admin"
+        - name: KC_HTTPS_CERTIFICATE_FILE
+          value: "/etc/keycloak-tls/tls.crt"
+        - name: KC_HTTPS_CERTIFICATE_KEY_FILE
+          value: "/etc/keycloak-tls/tls.key"
+        - name: KC_HTTPS_TRUST_STORE_FILE
+          value: "/etc/keycloak-ca/truststore.jks"
+        - name: KC_HTTPS_TRUST_STORE_PASSWORD
+          value: "changeit"
+        - name: KC_HOSTNAME_STRICT
+          value: "false"
+        - name: KC_HOSTNAME_STRICT_HTTPS
+          value: "false"
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 8443
+          name: https
+        volumeMounts:
+        - name: keycloak-tls
+          mountPath: /etc/keycloak-tls
+          readOnly: true
+        - name: keycloak-ca
+          mountPath: /etc/keycloak-ca
+          readOnly: true
+        resources:
+          requests:
+            memory: '512Mi'
+            cpu: '500m'
+          limits:
+            memory: '1Gi'
+            cpu: '1000m'
+      volumes:
+      - name: keycloak-tls
+        secret:
+          secretName: keycloak-tls
+      - name: keycloak-ca
+        secret:
+          secretName: keycloak-ca
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  selector:
+    app: keycloak
+  ports:
+  - port: 8080
+    targetPort: 8080
+    nodePort: 32090
+    name: http
+  - port: 8443
+    targetPort: 8443
+    nodePort: 32444
+    name: https
+  type: NodePort
+```
+# 2.3 Deployment Manifest
 Create the deployment file:
 ```bash
 nano ~/keycloak-deployment.yaml
