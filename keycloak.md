@@ -140,91 +140,80 @@ Create the deployment file:
 ```bash
 nano ~/postgres-deployment.yaml 
 ```
-
+following manifest:
 ```bash
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: keycloak
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: keycloak
+  name: postgres
   namespace: keycloak
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: keycloak
+      app: postgres
   template:
     metadata:
       labels:
-        app: keycloak
+        app: postgres
     spec:
       containers:
-      - name: keycloak
-        image: quay.io/keycloak/keycloak:latest
-        args: ["start-dev", "--https-client-auth=request"]
-        env:
-        - name: KC_BOOTSTRAP_ADMIN_USERNAME
-          value: "admin"
-        - name: KC_BOOTSTRAP_ADMIN_PASSWORD
-          value: "admin"
-        - name: KC_HTTPS_CERTIFICATE_FILE
-          value: "/etc/keycloak-tls/tls.crt"
-        - name: KC_HTTPS_CERTIFICATE_KEY_FILE
-          value: "/etc/keycloak-tls/tls.key"
-        - name: KC_HTTPS_TRUST_STORE_FILE
-          value: "/etc/keycloak-ca/truststore.jks"
-        - name: KC_HTTPS_TRUST_STORE_PASSWORD
-          value: "changeit"
-        - name: KC_HOSTNAME_STRICT
-          value: "false"
-        - name: KC_HOSTNAME_STRICT_HTTPS
-          value: "false"
+      - name: postgres
+        image: postgres:15
+        envFrom:
+        - secretRef:
+            name: keycloak-db-secret
         ports:
-        - containerPort: 8080
-          name: http
-        - containerPort: 8443
-          name: https
+        - containerPort: 5432
         volumeMounts:
-        - name: keycloak-tls
-          mountPath: /etc/keycloak-tls
-          readOnly: true
-        - name: keycloak-ca
-          mountPath: /etc/keycloak-ca
-          readOnly: true
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
         resources:
           requests:
-            memory: '512Mi'
-            cpu: '500m'
+            memory: "256Mi"
+            cpu: "250m"
           limits:
-            memory: '1Gi'
-            cpu: '1000m'
+            memory: "512Mi"
+            cpu: "500m"
       volumes:
-      - name: keycloak-tls
-        secret:
-          secretName: keycloak-tls
-      - name: keycloak-ca
-        secret:
-          secretName: keycloak-ca
+      - name: postgres-data
+        persistentVolumeClaim:
+          claimName: postgres-pvc
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: keycloak
+  name: postgres
   namespace: keycloak
 spec:
   selector:
-    app: keycloak
+    app: postgres
   ports:
-  - port: 8080
-    targetPort: 8080
-    nodePort: 32090
-    name: http
-  - port: 8443
-    targetPort: 8443
-    nodePort: 32444
-    name: https
-  type: NodePort
+  - port: 5432
+    targetPort: 5432
+
 ```
-# 2.3 Deployment Manifest
+
+Apply and wait for postgres to be ready:
+```bash
+kubectl apply -f ~/postgres-deployment.yaml
+kubectl rollout status deployment/postgres -n keycloak
+
+```
+# 2.5 Keycloak Deployment Manifest
 Create the deployment file:
 ```bash
 nano ~/keycloak-deployment.yaml
@@ -250,12 +239,16 @@ spec:
       containers:
       - name: keycloak
         image: quay.io/keycloak/keycloak:latest
-        args: ["start-dev", "--https-client-auth=request"]
+        args: ["start", "--https-client-auth=request", "--db=postgres", "--optimized=false"]
         env:
         - name: KC_BOOTSTRAP_ADMIN_USERNAME
           value: "admin"
         - name: KC_BOOTSTRAP_ADMIN_PASSWORD
           value: "admin"
+        - name: KC_HTTP_ENABLED
+          value: "true"
+        - name: KC_PROXY_HEADERS
+          value: "xforwarded"
         - name: KC_HTTPS_CERTIFICATE_FILE
           value: "/etc/keycloak-tls/tls.crt"
         - name: KC_HTTPS_CERTIFICATE_KEY_FILE
@@ -268,6 +261,20 @@ spec:
           value: "false"
         - name: KC_HOSTNAME_STRICT_HTTPS
           value: "false"
+        - name: KC_DB
+          value: "postgres"
+        - name: KC_DB_URL
+          value: "jdbc:postgresql://postgres.keycloak.svc.cluster.local:5432/keycloak"
+        - name: KC_DB_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: keycloak-db-secret
+              key: POSTGRES_USER
+        - name: KC_DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: keycloak-db-secret
+              key: POSTGRES_PASSWORD
         ports:
         - containerPort: 8080
           name: http
@@ -282,11 +289,11 @@ spec:
           readOnly: true
         resources:
           requests:
-            memory: '512Mi'
-            cpu: '500m'
+            memory: "512Mi"
+            cpu: "500m"
           limits:
-            memory: '1Gi'
-            cpu: '1000m'
+            memory: "1Gi"
+            cpu: "1000m"
       volumes:
       - name: keycloak-tls
         secret:
@@ -313,12 +320,14 @@ spec:
     nodePort: 32444
     name: https
   type: NodePort
+
 ```
 
-# 2.3 Apply and Verify
+# 2.6 Apply and Verify
 ```bash
 kubectl apply -f ~/keycloak-deployment.yaml
 kubectl get pods -n keycloak -w
+kubectl rollout status deployment/keycloak -n keycloak
 ```
 Wait until the pod shows STATUS = Running. Then verify Keycloak has started on both HTTP and HTTPS:
 ```bash
