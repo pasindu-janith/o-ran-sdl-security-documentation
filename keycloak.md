@@ -378,7 +378,7 @@ Step 2 — Capability Configuration
 Step 3 — Configure X.509 Certificate Authentication
 14.	Open the xapp-test client and navigate to the Credentials tab.
 15.	Change Client Authenticator from Client Id and Secret to X509 Certificate.
-16.	In the Subject DN field enter: .*CN=xapp-test.*
+16.	In the Subject DN field enter: .*CN=xapp-test.* //.*CN=xapp-test.*  
 17.	Check the Allow regex pattern comparison checkbox.
 18.	Click Save.
 
