@@ -10,7 +10,6 @@ View pods in specific namespace
 sudo kubectl get pod -n ricplt
 ```
 
-
 Delete all pods and restart them within a specific namespace:
 ```bash
 sudo kubectl delete pod --all -n ricplt
@@ -22,3 +21,7 @@ Check Connected E2 Nodes to the RIC:
 curl -X GET http://10.244.0.136:3800/v1/nodeb/states | jq .
 ```
 
+Remove all evicted, error and ContainerStatusUnknown Pods
+```bash 
+sudo kubectl get pods -A | grep -E 'Evicted|StatusUnknown|Error' | awk '{print $2 " --namespace=" $1}' | xargs -I {} sh -c "sudo kubectl delete pod {}"
+```
