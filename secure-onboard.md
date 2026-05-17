@@ -170,6 +170,12 @@ CSR_STRING=$(cat developer.csr)
 curl -X POST http://localhost:8000/api/v1/pki/sign-csr -F "developer_id=pasindu-dev-4545" -F "csr_pem=$CSR_STRING" | jq -r '.certificate' > developer.crt
 ```
 
+After new xApp registration SMO will keep a database inventory of xApps.
+
+```bash
+curl -X GET http://localhost:8000/api/v1/inventory/xapps
+```
+
 -------------------------------------------------------------
 Create another directory at Desktop for onboarder.
 Extract the smo-root-ca.crt from smo-server container.
