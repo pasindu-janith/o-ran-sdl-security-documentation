@@ -21,11 +21,12 @@ Cert-manager was deployed into the cluster using its standard Kubernetes manifes
 # Create the cert-manager namespace and install the stack
 sudo kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.2/cert-manager.yaml
 ```
-
+Wait until all pods are running. check pod status using this command.
 ```bash
 sudo kubectl get pods -n cert-manager
 ```
 
+create SMO root certificate as a kube secret within `cert-manager` namespace.
 ```bash
 sudo kubectl create secret tls smo-root-ca-secret \
   --cert=ca.crt \
@@ -33,6 +34,7 @@ sudo kubectl create secret tls smo-root-ca-secret \
   --namespace=cert-manager
 ```
 
+Apply cluster issuer for issue xApp certificates via cert-manager. create smo-issuer.yaml
 ```bash
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
@@ -48,7 +50,7 @@ spec:
 sudo kubectl apply -f smo-cluster-issuer.yaml
 ```
 
-```
+```bash
 kubectl get clusterissuer smo-root-ca -o wide
 # Expected Output: READY = True
 ```
@@ -320,6 +322,11 @@ spec:
 
 ```bash
 sudo kubectl apply -f kyverno-automation.yaml
+```
+
+After Kyverno deployment, onboard a xApp and check certificate generation and management via cert-manager.
+```bash
+sudo kubectl get certificate -n ricxapp
 ```
 
 # Common commands
