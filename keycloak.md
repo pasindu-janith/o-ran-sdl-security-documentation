@@ -98,13 +98,122 @@ kubectl get secrets -n keycloak
 
 # 2. Deploying Keycloak in Kubernetes
 Keycloak is deployed as a standard Kubernetes Deployment in its own namespace alongside the RIC platform. For development and research purposes, Keycloak runs in dev mode using an embedded H2 database. This means realm and client configuration will be lost if the pod is restarted. For production, replace the H2 database with PostgreSQL backed by a persistent volume.
+⚠  WARNING
+Keycloak previously ran in start-dev mode with an embedded H2 in-memory database, causing all realm and client configuration to be lost on every pod restart or VM reboot. This section replaces that setup with a PostgreSQL-backed deployment. Realm configuration now survives indefinitely.
+
 
 # 2.1 Create the Keycloak Namespace
 ```bash
 kubectl create namespace keycloak
 ```
+# 2.2 Create the Database Credentials Secret
+Store PostgreSQL credentials as a Kubernetes secret so they are never hardcoded in the deployment manifest.
+```bash
+kubectl create secret generic keycloak-db-secret \
+  --from-literal=POSTGRES_USER=keycloak \
+  --from-literal=POSTGRES_PASSWORD=keycloak123 \
+  --from-literal=POSTGRES_DB=keycloak \
+  -n keycloak
 
-# 2.2 Deployment Manifest
+```
+# 2.3 Install Local Storage Provisioner
+A bare-metal Kubernetes cluster has no StorageClass by default, which prevents PersistentVolumeClaims from binding. Install the local-path-provisioner — the same storage backend used by K3s — to enable persistent volumes on a single-node cluster
+```bash
+kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/deploy/local-path-storage.yaml
+```
+Wait for the provisioner to be ready
+```bash
+kubectl rollout status deployment/local-path-provisioner -n local-path-storage
+```
+Verify the storage class is now available:
+```bash
+kubectl get storageclass
+```
+Expected output:
+```bash
+NAME         PROVISIONER             RECLAIMPOLICY   VOLUMEBINDINGMODE
+local-path   rancher.io/local-path   Delete          WaitForFirstConsumer
+```
+
+# 2.4 PostgreSQL Deployment Manifest
+Create the deployment file:
+```bash
+nano ~/postgres-deployment.yaml 
+```
+following manifest:
+```bash
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: keycloak
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: keycloak
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15
+        envFrom:
+        - secretRef:
+            name: keycloak-db-secret
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      volumes:
+      - name: postgres-data
+        persistentVolumeClaim:
+          claimName: postgres-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: keycloak
+spec:
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+
+```
+
+Apply and wait for postgres to be ready:
+```bash
+kubectl apply -f ~/postgres-deployment.yaml
+kubectl rollout status deployment/postgres -n keycloak
+
+```
+# 2.5 Keycloak Deployment Manifest
 Create the deployment file:
 ```bash
 nano ~/keycloak-deployment.yaml
@@ -130,12 +239,16 @@ spec:
       containers:
       - name: keycloak
         image: quay.io/keycloak/keycloak:latest
-        args: ["start-dev", "--https-client-auth=request"]
+        args: ["start", "--https-client-auth=request", "--db=postgres", "--optimized=false"]
         env:
         - name: KC_BOOTSTRAP_ADMIN_USERNAME
           value: "admin"
         - name: KC_BOOTSTRAP_ADMIN_PASSWORD
           value: "admin"
+        - name: KC_HTTP_ENABLED
+          value: "true"
+        - name: KC_PROXY_HEADERS
+          value: "xforwarded"
         - name: KC_HTTPS_CERTIFICATE_FILE
           value: "/etc/keycloak-tls/tls.crt"
         - name: KC_HTTPS_CERTIFICATE_KEY_FILE
@@ -148,6 +261,20 @@ spec:
           value: "false"
         - name: KC_HOSTNAME_STRICT_HTTPS
           value: "false"
+        - name: KC_DB
+          value: "postgres"
+        - name: KC_DB_URL
+          value: "jdbc:postgresql://postgres.keycloak.svc.cluster.local:5432/keycloak"
+        - name: KC_DB_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: keycloak-db-secret
+              key: POSTGRES_USER
+        - name: KC_DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: keycloak-db-secret
+              key: POSTGRES_PASSWORD
         ports:
         - containerPort: 8080
           name: http
@@ -162,11 +289,11 @@ spec:
           readOnly: true
         resources:
           requests:
-            memory: '512Mi'
-            cpu: '500m'
+            memory: "512Mi"
+            cpu: "500m"
           limits:
-            memory: '1Gi'
-            cpu: '1000m'
+            memory: "1Gi"
+            cpu: "1000m"
       volumes:
       - name: keycloak-tls
         secret:
@@ -193,12 +320,14 @@ spec:
     nodePort: 32444
     name: https
   type: NodePort
+
 ```
 
-# 2.3 Apply and Verify
+# 2.6 Apply and Verify
 ```bash
 kubectl apply -f ~/keycloak-deployment.yaml
 kubectl get pods -n keycloak -w
+kubectl rollout status deployment/keycloak -n keycloak
 ```
 Wait until the pod shows STATUS = Running. Then verify Keycloak has started on both HTTP and HTTPS:
 ```bash
@@ -249,7 +378,7 @@ Step 2 — Capability Configuration
 Step 3 — Configure X.509 Certificate Authentication
 14.	Open the xapp-test client and navigate to the Credentials tab.
 15.	Change Client Authenticator from Client Id and Secret to X509 Certificate.
-16.	In the Subject DN field enter: .*CN=xapp-test.*
+16.	In the Subject DN field enter: .*CN=xapp-test.* //.*CN=xapp-test.*  
 17.	Check the Allow regex pattern comparison checkbox.
 18.	Click Save.
 
