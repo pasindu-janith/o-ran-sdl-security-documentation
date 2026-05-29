@@ -68,31 +68,41 @@ data:
   policy.rego: |
     package envoy.authz
 
+    # Required for modern OPA engines
     import rego.v1
 
-    # Only 'allow' is defined at the top level, so it is the only thing returned
-    default allow = false
+    # 1. Define Data Globally (Outside the rule to prevent unification bugs)
+    xapp_roles = {
+        "ricxapp-sdl-xapp": ["writer"],
+        "ts": ["reader"],
+        "rx": ["admin"]
+    }
 
+    role_permissions = {
+        "reader": ["GET", "EXISTS"],
+        "writer": ["GET", "SET", "DEL"],
+        "admin":  ["GET", "SET", "DEL", "FLUSHALL"]
+    }
+
+    # 2. Default deny
+    default allow := false
+
+    # 3. The Evaluation Rule (Now safely using 'if')
     allow if {
-        # Move all variables inside the rule to hide them from the API output
-        xapp_roles := {
-            "qp": ["writer"],
-            "ts": ["reader"],
-            "rx": ["admin"]
-        }
-
-        role_permissions := {
-            "reader": ["GET", "EXISTS"],
-            "writer": ["GET", "SET", "DEL"],
-            "admin":  ["GET", "SET", "DEL", "FLUSHALL"]
-        }
-
         xapp_id := input.attributes.request.http.headers["x-app-id"]
-        requested_action := input.attributes.request.http.headers["x-sdl-action"]
+        action := input.attributes.request.http.headers["x-sdl-action"]
 
-        # The RBAC Evaluation
-        some role in xapp_roles[xapp_id]
-        requested_action in role_permissions[role]
+        # Lookup roles for the xApp
+        roles := xapp_roles[xapp_id]
+
+        # Iterate through the xApp's roles
+        role := roles[_]
+
+        # Lookup permissions for that role
+        perms := role_permissions[role]
+
+        # Check if requested action matches one of the permissions
+        perms[_] == action
     }
     
 ```

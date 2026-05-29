@@ -79,13 +79,16 @@ data:
                 envoy_grpc:
                   cluster_name: auth_agent_cluster
               transport_api_version: V3
-          - name: envoy.filters.network.redis_proxy
+          - name: envoy.filters.network.tcp_proxy
             typed_config:
-              "@type": type.googleapis.com/envoy.extensions.filters.network.redis_proxy.v3.RedisProxy
-              stat_prefix: egress_redis
-              settings: { op_timeout: 5s }
-              prefix_routes:
-                catch_all_route: { cluster: real_sdl_cluster }
+              "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+              stat_prefix: egress_tcp
+              cluster: real_sdl_cluster
+              # Safely drops connection during micro-pauses between loops
+              idle_timeout: 0.5s
+              # Hard limit to ensure Keycloak token refresh cycles every ~2 mins
+              max_downstream_connection_duration: 115s
+              
       clusters:
       - name: auth_agent_cluster
         connect_timeout: 0.25s
@@ -96,6 +99,7 @@ data:
           endpoints:
           - lb_endpoints:
             - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 50051 } } }
+            
       - name: real_sdl_cluster
         connect_timeout: 0.5s
         type: STRICT_DNS
@@ -345,4 +349,9 @@ sudo kubectl logs ricxapp-sdl-xapp-686946b7-765hs -c auth-agent -n ricxapp
 
 ```bash
 sudo kubectl describe pod pod_name -n ricxapp
+```
+
+Check the which code is running:
+```bash
+sudo kubectl exec ricxapp-sdl-xapp-686946b7-5wn25 -c auth-agent -n ricxapp -- cat /app/agent.py
 ```
