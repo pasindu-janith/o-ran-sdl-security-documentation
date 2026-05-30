@@ -502,4 +502,282 @@ The OIDC discovery endpoint is a well-known URL that advertises all of Keycloak'
 curl --cacert ~/ric-certs/ca.crt \
   https://localhost:32444/realms/ric-realm/.well-known/openid-configuration
 
+# 7. xApp Claims in JWT Tokens
+Each xApp that authenticates with Keycloak using its X.509 certificate receives a JWT access token. By default this token only contains identity fields. To enable fine-grained SDL access control, additional claims must be injected into the token — specifically the SDL namespaces the xApp is permitted to access and the operations it is allowed to perform.
 
+The claims are stored in Keycloak's PostgreSQL database against the service account user that belongs to each client. Protocol mappers read these stored attributes at token issuance time and inject them as claims into the signed JWT. No changes to the certificate are needed.
+
+# 7.1 How Claims Flow into the Token
+The flow from xApp authentication to a claim-bearing JWT involves four components:
+
+•	Keycloak client: registered with clientId matching the certificate CN and X.509 authenticator type.
+•	Service account user: automatically created by Keycloak for each client; holds the claim values as user attributes in PostgreSQL.
+•	Protocol mappers: configured on the client; read the user attributes and inject them as named claims in the access token.
+•	JWT access token: returned to the xApp after mTLS authentication; contains the injected claims alongside standard OIDC fields.
+
+# 7.2 Step-by-Step: Attaching Claims to a Client
+Step 1 — Get an Admin Token
+All configuration is performed via the Keycloak Admin REST API. Obtain an admin token from the master realm first. This token is used for all subsequent API calls in this section.
+
+```bash
+MASTER_TOKEN=$(curl -s --cacert ~/ric-certs/ca.crt -X POST \
+  https://localhost:32444/realms/master/protocol/openid-connect/token \
+  -d "grant_type=password" \
+  -d "client_id=admin-cli" \
+  -d "username=admin" \
+  -d "password=admin" | \
+  python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+ 
+echo "Token: ${MASTER_TOKEN:0:20}..."
+```
+
+Step 2 — Get the Client UUID and Service Account User ID
+Each Keycloak client has an internal UUID distinct from its clientId. The service account user ID is also needed to set attribute values. Retrieve both:
+
+```bash
+# Get client UUID
+CLIENT_UUID=$(curl -s --cacert ~/ric-certs/ca.crt \
+  -H "Authorization: Bearer $MASTER_TOKEN" \
+  "https://localhost:32444/admin/realms/ric-realm/clients?clientId=ricxapp-sdl-xapp" | \
+  python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])")
+echo "Client UUID: $CLIENT_UUID"
+ 
+# Get service account user ID
+SA_ID=$(curl -s --cacert ~/ric-certs/ca.crt \
+  -H "Authorization: Bearer $MASTER_TOKEN" \
+  "https://localhost:32444/admin/realms/ric-realm/clients/$CLIENT_UUID/service-account-user" | \
+  python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+echo "Service account user ID: $SA_ID"
+
+```
+
+Step 3 — Set Claim Values on the Service Account User
+The actual claim values (what gets injected into the token) are stored as user attributes on the service account user. Set them with a single PUT request:
+
+```bash
+curl -s --cacert ~/ric-certs/ca.crt \
+  -H "Authorization: Bearer $MASTER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -X PUT "https://localhost:32444/admin/realms/ric-realm/users/$SA_ID" \
+  -d '{
+    "username": "service-account-ricxapp-sdl-xapp",
+    "attributes": {
+      "x_app_id":    ["ricxapp-sdl-xapp"],
+      "x_sdl_action": ["SET"]
+    }
+  }'
+
+# Verify the attributes were saved:
+curl -s --cacert ~/ric-certs/ca.crt \
+  -H "Authorization: Bearer $MASTER_TOKEN" \
+  "https://localhost:32444/admin/realms/ric-realm/users/$SA_ID" | \
+  python3 -c "import sys,json; u=json.load(sys.stdin); print(u.get('attributes','MISSING'))"
+
+#Expected output:
+{'x_app_id': ['ricxapp-sdl-xapp'], 'x_sdl_action': ['SET']}
+
+```
+
+Step 4 — Add Protocol Mappers
+Protocol mappers are the bridge between stored user attributes and JWT claims. Add one mapper per claim. The user.attribute field must exactly match the attribute key set in Step 3. The claim.name field is what appears in the JWT.
+Save the following as a script to avoid terminal corruption of JSON field names:
+
+```bash
+cat > ~/add-mappers.sh << 'EOF'
+#!/bin/bash
+MASTER_TOKEN=$(curl -s --cacert ~/ric-certs/ca.crt -X POST \
+  https://localhost:32444/realms/master/protocol/openid-connect/token \
+  -d "grant_type=password" -d "client_id=admin-cli" \
+  -d "username=admin" -d "password=admin" | \
+  python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+ 
+CLIENT_UUID=$(curl -s --cacert ~/ric-certs/ca.crt \
+  -H "Authorization: Bearer $MASTER_TOKEN" \
+  "https://localhost:32444/admin/realms/ric-realm/clients?clientId=ricxapp-sdl-xapp" | \
+  python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])")
+ 
+echo "Client UUID: $CLIENT_UUID"
+ 
+# Mapper: x_app_id -> x_app_id claim
+curl -s --cacert ~/ric-certs/ca.crt \
+  -H "Authorization: Bearer $MASTER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -X POST "https://localhost:32444/admin/realms/ric-realm/clients/$CLIENT_UUID/protocol-mappers/models" \
+
+  -d '{"name":"x-app-id","protocol":"openid-connect","protocolMapper":"oidc-usermodel-attribute-mapper","config":{"user.attribute":"x_app_id","claim.name":"x_app_id","jsonType.label":"String","access.token.claim":"true","id.token.claim":"false","userinfo.token.claim":"false","aggregate.attrs":"false"}}'
+echo "x-app-id mapper: $?"
+ 
+# Mapper: x_sdl_action -> x_sdl_action claim
+curl -s --cacert ~/ric-certs/ca.crt \
+  -H "Authorization: Bearer $MASTER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -X POST "https://localhost:32444/admin/realms/ric-realm/clients/$CLIENT_UUID/protocol-mappers/models" \
+  -d '{"name":"x-sdl-action","protocol":"openid-connect","protocolMapper":"oidc-usermodel-attribute-mapper","config":{"user.attribute":"x_sdl_action","claim.name":"x_sdl_action","jsonType.label":"String","access.token.claim":"true","id.token.claim":"false","userinfo.token.claim":"false","aggregate.attrs":"false"}}'
+echo "x-sdl-action mapper: $?"
+EOF
+ 
+bash ~/add-mappers.sh
+
+
+```
+
+Step 5 — Request a Token and Verify Claims
+Extract the certificate and key from the cert-manager secret, then request a token and decode the claims:
+
+```bash
+# Extract cert-manager issued certificate
+kubectl get secret ricxapp-sdl-xapp-certs -n ricxapp \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d > /tmp/xapp.crt
+kubectl get secret ricxapp-sdl-xapp-certs -n ricxapp \
+  -o jsonpath='{.data.tls\.key}' | base64 -d > /tmp/xapp.key
+ 
+# Confirm the CN matches the Keycloak client ID
+openssl x509 -in /tmp/xapp.crt -noout -subject
+ 
+# Request token via mTLS
+curl -s --cacert ~/ric-certs/ca.crt \
+  --cert /tmp/xapp.crt \
+  --key /tmp/xapp.key \
+  -X POST \
+  https://localhost:32444/realms/ric-realm/protocol/openid-connect/token \
+  -d "grant_type=client_credentials" \
+  -d "client_id=ricxapp-sdl-xapp" | \
+  python3 -c "
+import sys,json,base64
+resp=json.load(sys.stdin)
+if 'error' in resp:
+    print('ERROR:', resp); sys.exit(1)
+t=resp['access_token']
+p=t.split('.')[1]
+p+='='*(-len(p)%4)
+c=json.loads(base64.b64decode(p))
+print()
+print('All claims:')
+for k,v in sorted(c.items()):
+    print(f'  {k}: {v}')
+print()
+print('SDL claims:')
+print('  x_app_id    :', c.get('x_app_id','MISSING'))
+print('  x_sdl_action:', c.get('x_sdl_action','MISSING'))
+"
+ 
+# Cleanup
+rm -f /tmp/xapp.crt /tmp/xapp.key
+
+# Expected output:
+All claims:
+  acr: 1
+  aud: account
+  azp: ricxapp-sdl-xapp
+  exp: 1777434464
+  iss: https://localhost:32444/realms/ric-realm
+  jti: tRrtcc:...
+  scope: email profile
+  sub: 7497c729-83ec-41fe-b246-d1a54ef1b400
+  x_app_id: ricxapp-sdl-xapp
+  x_sdl_action: SET
+ 
+SDL claims:
+  x_app_id    : ricxapp-sdl-xapp
+  x_sdl_action: SET
+
+```
+# 7.3 Idempotent Full Setup Script
+The following script handles the complete claims setup for any xApp client. It checks whether each resource already exists before creating it, so it is safe to run multiple times without duplicating configuration. Use this as the standard onboarding script for new xApps.
+
+```bash
+cat > ~/setup-xapp-claims.sh << 'EOF'
+#!/bin/bash
+set -e
+ 
+XAPP_CLIENT="ricxapp-sdl-xapp"          # Keycloak client ID = cert CN
+SA_USERNAME="service-account-$XAPP_CLIENT"
+SDL_NAMESPACES="ric.test"
+SDL_OPERATIONS="read,write"
+X_APP_ID="$XAPP_CLIENT"
+X_SDL_ACTION="SET"
+ 
+echo "===== xApp Claims Setup: $XAPP_CLIENT ====="
+ 
+MASTER_TOKEN=$(curl -s --cacert ~/ric-certs/ca.crt -X POST \
+  https://localhost:32444/realms/master/protocol/openid-connect/token \
+  -d "grant_type=password" -d "client_id=admin-cli" \
+  -d "username=admin" -d "password=admin" | \
+  python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+echo "[1] Admin token acquired"
+ 
+CLIENT_UUID=$(curl -s --cacert ~/ric-certs/ca.crt \
+  -H "Authorization: Bearer $MASTER_TOKEN" \
+  "https://localhost:32444/admin/realms/ric-realm/clients?clientId=$XAPP_CLIENT" | \
+  python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])")
+echo "[2] Client UUID: $CLIENT_UUID"
+ 
+SA_ID=$(curl -s --cacert ~/ric-certs/ca.crt \
+  -H "Authorization: Bearer $MASTER_TOKEN" \
+  "https://localhost:32444/admin/realms/ric-realm/clients/$CLIENT_UUID/service-account-user" | \
+  python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+echo "[3] Service account user ID: $SA_ID"
+ 
+curl -s --cacert ~/ric-certs/ca.crt \
+  -H "Authorization: Bearer $MASTER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -X PUT "https://localhost:32444/admin/realms/ric-realm/users/$SA_ID" \
+  -d "{\"username\":\"$SA_USERNAME\",\"attributes\":{\"x_app_id\":[\"$X_APP_ID\"],\"x_sdl_action\":[\"$X_SDL_ACTION\"],\"sdl_namespaces\":[\"$SDL_NAMESPACES\"],\"sdl_operations\":[\"$SDL_OPERATIONS\"]}}"
+echo "[4] Attributes set"
+ 
+EXISTING=$(curl -s --cacert ~/ric-certs/ca.crt \
+  -H "Authorization: Bearer $MASTER_TOKEN" \
+  "https://localhost:32444/admin/realms/ric-realm/clients/$CLIENT_UUID/protocol-mappers/models" | \
+  python3 -c "import sys,json; print([m['name'] for m in json.load(sys.stdin)])")
+ 
+for MAPPER_NAME in "x-app-id" "x-sdl-action" "sdl-namespaces" "sdl-operations"; do
+  if echo "$EXISTING" | grep -q "$MAPPER_NAME"; then
+    echo "[5] Mapper $MAPPER_NAME already exists, skipping."
+  else
+    case $MAPPER_NAME in
+      x-app-id)      UA="x_app_id";      CN="x_app_id";;
+      x-sdl-action)  UA="x_sdl_action";  CN="x_sdl_action";;
+      sdl-namespaces) UA="sdl_namespaces"; CN="sdl_ns";;
+      sdl-operations) UA="sdl_operations"; CN="sdl_ops";;
+    esac
+    curl -s --cacert ~/ric-certs/ca.crt \
+      -H "Authorization: Bearer $MASTER_TOKEN" \
+      -H "Content-Type: application/json" \
+      -X POST "https://localhost:32444/admin/realms/ric-realm/clients/$CLIENT_UUID/protocol-mappers/models" \
+      -d "{\"name\":\"$MAPPER_NAME\",\"protocol\":\"openid-connect\",\"protocolMapper\":\"oidc-usermodel-attribute-mapper\",\"config\":{\"user.attribute\":\"$UA\",\"claim.name\":\"$CN\",\"jsonType.label\":\"String\",\"access.token.claim\":\"true\",\"id.token.claim\":\"false\",\"userinfo.token.claim\":\"false\",\"aggregate.attrs\":\"false\"}}"
+    echo "[5] Mapper $MAPPER_NAME added"
+  fi
+done
+ 
+echo ""
+echo "===== Verifying token claims ====="
+kubectl get secret ricxapp-sdl-xapp-certs -n ricxapp \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d > /tmp/xapp.crt
+kubectl get secret ricxapp-sdl-xapp-certs -n ricxapp \
+  -o jsonpath='{.data.tls\.key}' | base64 -d > /tmp/xapp.key
+ 
+curl -s --cacert ~/ric-certs/ca.crt \
+  --cert /tmp/xapp.crt --key /tmp/xapp.key \
+  -X POST \
+  https://localhost:32444/realms/ric-realm/protocol/openid-connect/token \
+  -d "grant_type=client_credentials" \
+  -d "client_id=$XAPP_CLIENT" | \
+  python3 -c "
+import sys,json,base64
+t=json.load(sys.stdin)['access_token']
+p=t.split('.')[1]; p+='='*(-len(p)%4)
+c=json.loads(base64.b64decode(p))
+print('x_app_id    :', c.get('x_app_id','MISSING'))
+print('x_sdl_action:', c.get('x_sdl_action','MISSING'))
+print('sdl_ns      :', c.get('sdl_ns','MISSING'))
+print('sdl_ops     :', c.get('sdl_ops','MISSING'))
+ok=all(c.get(k) for k in ['x_app_id','x_sdl_action','sdl_ns','sdl_ops'])
+print('STATUS:', 'SUCCESS' if ok else 'FAILED')
+"
+rm -f /tmp/xapp.crt /tmp/xapp.key
+EOF
+ 
+bash ~/setup-xapp-claims.sh
+
+
+```
