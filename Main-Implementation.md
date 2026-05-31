@@ -3,11 +3,14 @@
 Deploy the Keycloak server as described in keycloak.md
 
 xApp pod contains 3 containers. 
-1.xApp container
-2.Envoy sidecar
-3.Auth Agent Container
-
-
+1. xApp container
+   - Hosts the core xApp application logic. 
+2. Envoy sidecar
+   - Acts as a secure proxy for inbound and outbound traffic. It is the data plane traffic manager.
+3. Auth Agent Container
+   - Periodically fetches and caches the JWT from Keycloak.
+   - Engage with control plane Keycloak and OPA for its operations.
+  
 # Phase 1: Cert-Manager Setup & PKI Configuration
 
 In our Zero Trust O-RAN architecture, **cert-manager** acts as the automated Public Key Infrastructure (PKI) engine inside the Kubernetes cluster. It is responsible for dynamically minting, delivering, and managing X.509 Mutual TLS (mTLS) certificates for every xApp deployed in the RIC. 
