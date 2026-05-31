@@ -1,4 +1,8 @@
-# Main Implementation Steps
+# Localized PEP approach in xApp pod as Zero Trust Architecture for O-RAN Shared Data Layer (SDL)
+
+In this method we are suggesting introduce sidecars within xApp pods and DBaaS pod will not be changed.
+
+## Main Implementation Steps
 
 Deploy the Keycloak server as described in keycloak.md
 
@@ -6,11 +10,64 @@ xApp pod contains 3 containers.
 1. xApp container
    - Hosts the core xApp application logic. 
 2. Envoy sidecar
-   - Acts as a secure proxy for inbound and outbound traffic. It is the data plane traffic manager.
+   - Acts as a secure proxy for inbound and outbound traffic. 
+   - It is the data plane traffic manager.
 3. Auth Agent Container
    - Periodically fetches and caches the JWT from Keycloak.
    - Engage with control plane Keycloak and OPA for its operations.
-  
+
+```mermaid
+flowchart TB
+    %% Styling definitions to match the image colors
+    classDef clusterFill fill:#e1f5fe,stroke:#000,stroke-width:1px;
+    classDef podFill fill:#fff9c4,stroke:#000,stroke-width:1px;
+    classDef greenBox fill:#bdf4cc,stroke:#000,stroke-width:1px;
+    classDef purpleBox fill:#d9c2ff,stroke:#000,stroke-width:1px;
+    classDef pinkBox fill:#ffc7ce,stroke:#000,stroke-width:1px;
+    classDef yellowBox fill:#ffeeb5,stroke:#000,stroke-width:1px;
+
+    subgraph RIC_Cluster [RIC Cluster]
+        
+        subgraph xApp_Pod [xApp Pod]
+            direction LR
+            
+            subgraph InnerFlow [ ]
+                direction TB
+                xApp["xApp container<br/><br/><b>SDL API</b>"]:::greenBox
+                Envoy["Envoy<br/>Sidecar"]:::purpleBox
+                
+                xApp -- "(1) GET/SET req." --> Envoy
+                Envoy --> xApp
+            end
+            
+            AuthAgent["Auth Agent<br/><br/>(3) &nbsp; &nbsp; (6) &nbsp; &nbsp; (9)"]:::greenBox
+            
+            Envoy -- "(2) gRPC req." --> AuthAgent
+            AuthAgent -- "(10) gRPC res.<br/>ALLOW/DENY" --> Envoy
+        end
+
+        Redis["Redis<br/>Database"]:::pinkBox
+        Keycloak["Keycloak Server"]:::yellowBox
+        OPA["Open Policy<br/>Agent"]:::yellowBox
+
+        %% Connections outside the pod
+        Envoy -- "(11)" --> Redis
+        Redis --> Envoy
+
+        AuthAgent -- "(4) Req.<br/>Access token<br/>REST/HTTPS" ---> Keycloak
+        Keycloak -- "(5) Res.<br/>Access token" ---> AuthAgent
+
+        AuthAgent -- "(7) JSON input<br/>query<br/>REST/HTTPS" ---> OPA
+        OPA -- "(8) OPA<br/>Decision (JSON)" ---> AuthAgent
+    end
+
+    %% Apply background colors to subgraphs
+    class RIC_Cluster clusterFill;
+    class xApp_Pod podFill;
+    style InnerFlow fill:none,stroke:none;
+
+```
+
 # Phase 1: Cert-Manager Setup & PKI Configuration
 
 In our Zero Trust O-RAN architecture, **cert-manager** acts as the automated Public Key Infrastructure (PKI) engine inside the Kubernetes cluster. It is responsible for dynamically minting, delivering, and managing X.509 Mutual TLS (mTLS) certificates for every xApp deployed in the RIC. 
@@ -113,7 +170,8 @@ data:
             - endpoint: { address: { socket_address: { address: service-ricplt-dbaas-tcp.ricplt.svc.cluster.local, port_value: 6379 } } }
 
   agent.py: |
-    import grpc, requests, time, os
+    import grpc, requests, time, os, json, base64
+    from datetime import datetime
     from concurrent import futures
     import envoy.service.auth.v3.external_auth_pb2 as auth_pb2
     import envoy.service.auth.v3.external_auth_pb2_grpc as auth_pb2_grpc
@@ -125,7 +183,7 @@ data:
 
     KEYCLOAK_URL = "https://keycloak.keycloak.svc.cluster.local:8443/realms/ric-realm/protocol/openid-connect/token"
     # Note: Pointing to your deployed OPA gRPC port 9191
-    OPA_GRPC_URL = "opa-service.ricplt.svc.cluster.local:9191" 
+    OPA_GRPC_URL = "opa-service.ricplt.svc.cluster.local:9191"
     XAPP_NAME = os.environ.get("XAPP_NAME", "unknown-xapp")
     CERT, KEY = "/etc/xapp-certs/tls.crt", "/etc/xapp-certs/tls.key"
 
@@ -135,12 +193,18 @@ data:
             self.expiry = 0
 
         def fetch_token(self):
-            print(f"[AGENT] Fetching mTLS token for {XAPP_NAME}...")
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[AGENT] [{timestamp}] Fetching mTLS token for {XAPP_NAME}...")
+            fetch_start_time = time.time()
             try:
                 res = requests.post(KEYCLOAK_URL, data={'grant_type': 'client_credentials', 'client_id': XAPP_NAME}, cert=(CERT, KEY), verify=False)
+                fetch_end_time = time.time()
+                elapsed_ms = int((fetch_end_time - fetch_start_time) * 1000)
+
                 if res.status_code == 200:
                     self.token = res.json().get("access_token")
-                    self.expiry = time.time() + int(res.json().get("expires_in", 300))
+                    self.expiry = time.time() + 120
+                    print(f"[AGENT] [{timestamp}] Token successfully fetched in {elapsed_ms}ms. Expiry set to 2 minutes.", flush=True)
                     return True
             except Exception as e:
                 print(f"[AGENT] Keycloak Error: {e}")
@@ -158,7 +222,7 @@ data:
             try:
                 with grpc.insecure_channel(OPA_GRPC_URL) as channel:
                     stub = auth_pb2_grpc.AuthorizationStub(channel)
-                    
+
                     # Constructing the Payload to match your Rego 'input.attributes.request.http.headers'
                     opa_request = auth_pb2.CheckRequest(
                         attributes=attribute_context_pb2.AttributeContext(
@@ -168,7 +232,8 @@ data:
                                         "x-app-id": XAPP_NAME,
                                         # Connection-level auth defaults to GET to pass your policy
                                         # True per-command auth requires Redis Proxy RBAC
-                                        "x-sdl-action": "SET" 
+                                        "x-sdl-action": "SET"
+
                                     }
                                 )
                             )

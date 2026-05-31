@@ -88,6 +88,8 @@ flowchart TD
 
 Deploy the Keycloak server as described in keycloak.md
 
+The ambassador and translator containers are built and pushed into DockerHub->pasindujanith. These development pull those images at its relevant operating points. Python scripts, Dockerfiles to build images and other instructions are given in `ambassador-and-translator.md` file at this repo.
+
 ## Cert-Manager Setup & PKI Configuration
 
 In our Zero Trust O-RAN architecture, **cert-manager** acts as the automated Public Key Infrastructure (PKI) engine inside the Kubernetes cluster. It is responsible for dynamically minting, delivering, and managing X.509 Mutual TLS (mTLS) certificates for every xApp deployed in the RIC. 
