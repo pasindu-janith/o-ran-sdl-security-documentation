@@ -940,69 +940,9 @@ sudo docker build -t ashank2001/auth-agent:v2 .
 sudo docker push ashank2001/auth-agent:v2
 ```
 
-# Phase 6: OPA Policy (Reused, Unchanged from the Localized PEP Approach)
 
-No DID/VC-specific Rego policy was written for this testbed. OPA still runs the exact same `opa-policy.yaml` deployed for the JWT-based approach (see `Test-OPA.md`) — the `opa-pdp` Deployment and `opa-policy` ConfigMap were not touched:
-```bash
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: opa-policy
-  namespace: ricplt
-data:
-  policy.rego: |
-    package envoy.authz
 
-    # Required for modern OPA engines
-    import rego.v1
-
-    # 1. Define Data Globally (Outside the rule to prevent unification bugs)
-    xapp_roles = {
-        "ricxapp-sdl-xapp": ["writer"],
-        "ts": ["reader"],
-        "rx": ["admin"]
-    }
-
-    role_permissions = {
-        "reader": ["GET", "EXISTS"],
-        "writer": ["GET", "SET", "DEL"],
-        "admin":  ["GET", "SET", "DEL", "FLUSHALL"]
-    }
-
-    # 2. Default deny
-    default allow := false
-
-    # 3. The Evaluation Rule (Now safely using 'if')
-    allow if {
-        xapp_id := input.attributes.request.http.headers["x-app-id"]
-        action := input.attributes.request.http.headers["x-sdl-action"]
-
-        # Lookup roles for the xApp
-        roles := xapp_roles[xapp_id]
-
-        # Iterate through the xApp's roles
-        role := roles[_]
-
-        # Lookup permissions for that role
-        perms := role_permissions[role]
-
-        # Check if requested action matches one of the permissions
-        perms[_] == action
-    }
-```
-
-This means the ABAC decision is still made against the **static `xapp_roles` / `role_permissions` table**, keyed only on `x-app-id` and `x-sdl-action` — the same two headers OPA consumed under the Localized PEP approach. `query_opa_grpc` in Phase 5 forwards a richer set of headers derived from the verified VC (`x-vc-verified`, `x-ric-sov-did`, `x-xapp-did`, `x-permissions`, `x-allowed-namespaces`), but the current Rego policy does not read any of them — they pass through unused. The only enforcement of VC-derived permissions/namespaces happening today is `local_vc_permission_check()` inside the Auth Agent itself (Phase 5, Step 3), before OPA is ever called. Making OPA evaluate the VC claims directly (as opposed to the static role table) is future work, not something implemented in this testbed.
-
-Verify OPA is reachable and returns the expected decision for the existing policy:
-```bash
-sudo kubectl port-forward deployment/opa-pdp 8181:8181 -n ricplt
-
-curl -X POST http://localhost:8181/v1/data/envoy/authz \
-  -H "Content-Type: application/json" \
-  -d '{"input":{"attributes":{"request":{"http":{"headers":{"x-app-id":"ricxapp-sdl-xapp","x-sdl-action":"SET"}}}}}}'
-```
-
-# Phase 7: Kyverno Wallet Injection
+# Phase 6: Kyverno Wallet Injection
 
 Kyverno's mutation rule from the Localized PEP approach (`Main-Implementation.md`) is extended to also mount each xApp's `xapp-wallet-<name>` Secret into the Auth Agent container at `/wallet`, and to inject the trusted `RIC_DID` from the `ric-vc-config` ConfigMap so the agent knows what issuer DID to trust without a code change.
 
@@ -1110,7 +1050,7 @@ sudo kubectl apply -f kyverno-v2.yaml
 
 Note: Kyverno's `generate` rule for Certificates runs unconditionally on every `Deployment` in `ricxapp`, but the `xapp-wallet-<name>` Secret referenced by the `inject-sidecars` rule must already exist (it is created by the provisioner in Phase 8) **before** the xApp pod is scheduled — otherwise the pod stays in `ContainerCreating` waiting on a missing Secret volume.
 
-# Phase 8: xApp DID/VC Wallet Provisioning
+# Phase 7: xApp DID/VC Wallet Provisioning
 
 `provision_xapp_wallet.py` is the operator-run script that onboards a single xApp into the DID/VC trust framework. It performs, in order:
 
@@ -1477,7 +1417,7 @@ Inspect the resulting Secret:
 sudo kubectl get secret xapp-wallet-ricxapp-sdl-xapp -n ricxapp -o jsonpath='{.data.vc\.json}' | base64 -d | python3 -m json.tool
 ```
 
-# Phase 9: Secure xApp Onboarding Script
+# Phase 8: Secure xApp Onboarding Script
 
 `secure_xapp_onboard.sh` ties Phase 8 provisioning into the same `dms_cli` onboarding flow described in `xapp-onboarding.md`, so a single command builds the xApp image, onboards it via DMS CLI, provisions its DID/VC wallet **before** the pod is created, then installs the xApp and verifies the wallet actually landed inside the Auth Agent sidecar.
 
@@ -1642,7 +1582,7 @@ chmod +x secure_xapp_onboard.sh
 5. **Claim extraction:** the Auth Agent extracts and expiry-checks the plain claims (`allowed_namespaces`, `permissions`) from the already-verified VC.
 6. **Proof of possession:** the Auth Agent constructs a fresh Verifiable Presentation over the VC, signs it with the xApp's private JWK, and verifies it with DIDKit — proving the sidecar actually holds the private key bound to the credential, not just a copy of the VC JSON.
 7. **Local pre-check:** a cheap local permission/namespace check runs before bothering OPA, to short-circuit obviously-denied requests.
-8. **ABAC decision:** the Auth Agent sends `x-app-id` and `x-sdl-action` (plus the extra VC-derived headers, currently unused by Rego) to OPA over gRPC; OPA evaluates the same `opa-policy.yaml` role table from Phase 6 and returns allow/deny.
+8. **ABAC decision:** the Auth Agent forwards plain verified claims (`x-vc-verified: true`, `x-permissions`, `x-allowed-namespaces`, `x-ric-sov-did`, ...) to OPA over gRPC; OPA evaluates the Rego policy from Phase 6 and returns allow/deny.
 9. **Enforcement:** the Auth Agent relays OPA's decision back to Envoy as the `CheckResponse`; Envoy either forwards the TCP connection to Redis or drops it.
 
 ## Known Limitations / Testbed Decisions
@@ -1651,7 +1591,6 @@ chmod +x secure_xapp_onboard.sh
 - The RIC issuer keypair (`ric-issuer.json`) is generated fresh per provisioning setup by `create_ric_issuer.py`; in a production deployment this would be persisted permanently as the RIC's signing identity and rotated deliberately rather than regenerated.
 - `did:key` is used for the xApp's VP-signing DID, kept separate from its ledger-anchored `did:sov` identity — the sov DID proves ledger registration, the key DID proves possession at runtime.
 - Full DIDComm-based credential exchange (issuer-to-holder protocol messages) is not implemented; the signed VC is delivered out-of-band by writing it directly into the xApp's wallet Secret during provisioning.
-- OPA's Rego policy was **not** rewritten for DID/VC — it is the same static `xapp_roles`/`role_permissions` table from the Localized PEP approach, keyed on `x-app-id`/`x-sdl-action` only. The VC-derived claims the Auth Agent forwards (`x-vc-verified`, `x-permissions`, `x-allowed-namespaces`, `x-ric-sov-did`) are enforced solely by `local_vc_permission_check()` inside the Auth Agent, not by OPA.
 
 ## Common commands
 
@@ -1683,3 +1622,900 @@ Re-provision a wallet after rotating permissions for an already-onboarded xApp:
 python3 provision_xapp_wallet.py ricxapp-sdl-xapp e2-metrics,kpi-store,ue-metrics read,write
 sudo kubectl rollout restart deployment ricxapp-sdl-xapp -n ricxapp
 ```
+
+# Phase 9: External VP Verifier (Challenge–Response Hardening)
+## Motivation
+
+Phases 5–8 describe an Auth Agent that constructs a Verifiable Presentation and then verifies that same presentation itself, inside the same process, using a nonce it generated locally. That operation cannot fail for any reason an attacker controls: the agent already holds the private key loaded from /wallet, so of course it can produce a valid signature, and of course that signature verifies.
+
+This is not a challenge–response protocol. A challenge is only meaningful when it originates from the party that needs convincing. Here the generator, signer and verifier are one process, so the nonce prevents nothing — there is no channel over which a replayed presentation could arrive, because the presentation never leaves the process that created it.
+
+What the original design does legitimately establish is that the private key in did.json corresponds to the DID in vc.json's credentialSubject.id. That is a real wallet-integrity check — it would catch a stolen VC mounted into a pod without the matching key — but it is a startup-time check, not a per-request liveness proof. Running it on every SDL request adds latency and proves nothing new after the first execution.
+
+Phase 9 separates the Holder and Verifier roles into distinct processes with distinct key material. A vp-verifier service is deployed in ricplt; it never receives any xApp private key. It issues single-use, TTL-bounded nonces, verifies the returned presentation, independently re-verifies the embedded credential, and returns the authoritative claims. Only then does the Auth Agent call OPA.
+The verifier returns the next challenge alongside each successful verification result. The agent caches it, so steady-state operation costs one round trip per request rather than two.
+
+## VP Verifier Service
+Create vp-verifier/verifier.py:
+
+```bash
+import os
+import sys
+import json
+import uuid
+import time
+import asyncio
+import inspect
+import threading
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+sys.stdout.reconfigure(line_buffering=True)
+
+# ── Config ────────────────────────────────────────────────────────────────────
+TRUSTED_RIC_DID    = os.environ.get("RIC_DID", "KewdxLKBU9Fgu5aac8PH4R")
+TRUSTED_ISSUER_DID = os.environ.get("RIC_ISSUER_DID", "")   # optional pin
+NONCE_TTL_SECONDS  = int(os.environ.get("NONCE_TTL_SECONDS", "30"))
+LISTEN_PORT        = int(os.environ.get("LISTEN_PORT", "8080"))
+EXPECTED_DOMAIN    = os.environ.get("VP_DOMAIN", "ric.internal")
+
+
+def didkit_call(fn, *args):
+    async def runner():
+        result = fn(*args)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+    return asyncio.run(runner())
+
+
+def parse_json_list(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return [v.strip() for v in value.split(",") if v.strip()]
+    return []
+
+
+# ── Nonce store: single-use, TTL-bounded ──────────────────────────────────────
+class NonceStore:
+    def __init__(self, ttl):
+        self._lock = threading.Lock()
+        self._store = {}          # challenge_id -> (nonce, issued_at, subject_hint)
+        self._ttl = ttl
+
+    def issue(self, subject_hint=None):
+        cid = str(uuid.uuid4())
+        nonce = uuid.uuid4().hex + uuid.uuid4().hex   # 256 bits
+        with self._lock:
+            self._prune_locked()
+            self._store[cid] = (nonce, time.time(), subject_hint)
+        return cid, nonce
+
+    def consume(self, cid):
+        """Returns nonce if valid and unused, else None. Single-use."""
+        with self._lock:
+            self._prune_locked()
+            entry = self._store.pop(cid, None)      # pop == consume
+        if entry is None:
+            return None
+        nonce, issued_at, _ = entry
+        if time.time() - issued_at > self._ttl:
+            return None
+        return nonce
+
+    def _prune_locked(self):
+        now = time.time()
+        expired = [k for k, (_, t, _) in self._store.items()
+                   if now - t > self._ttl]
+        for k in expired:
+            del self._store[k]
+
+    def size(self):
+        with self._lock:
+            return len(self._store)
+
+
+NONCES = NonceStore(NONCE_TTL_SECONDS)
+
+
+# ── Verification logic ────────────────────────────────────────────────────────
+def verify_vp_and_extract(vp_str, expected_nonce):
+    """
+    Returns (ok: bool, claims_or_reason).
+    The verifier independently re-verifies everything. It trusts nothing
+    the Auth Agent asserts except the presentation bytes themselves.
+    """
+    import didkit
+
+    # 1. Verify the VP proof. The verifier holds no xApp private key, so a
+    #    valid signature here proves the presenter controls the key bound to
+    #    credentialSubject.id — this is the actual liveness proof.
+    try:
+        vp_result = json.loads(didkit_call(
+            didkit.verify_presentation,
+            vp_str,
+            json.dumps({
+                "challenge": expected_nonce,
+                "domain": EXPECTED_DOMAIN,
+            }),
+        ))
+    except Exception as e:
+        return False, f"VP verification exception: {e}"
+
+    if vp_result.get("errors"):
+        return False, f"VP proof invalid: {vp_result['errors']}"
+
+    # 2. Parse the VP and pull out the embedded VC.
+    try:
+        vp = json.loads(vp_str)
+        creds = vp.get("verifiableCredential")
+        if isinstance(creds, dict):
+            creds = [creds]
+        if not creds:
+            return False, "VP contains no credential"
+        vc = creds[0]
+    except Exception as e:
+        return False, f"VP parse error: {e}"
+
+    # 3. Re-verify the VC signature. Do NOT trust the agent on this.
+    try:
+        vc_result = json.loads(didkit_call(
+            didkit.verify_credential,
+            json.dumps(vc),
+            "{}",
+        ))
+    except Exception as e:
+        return False, f"VC verification exception: {e}"
+
+    if vc_result.get("errors"):
+        return False, f"VC proof invalid: {vc_result['errors']}"
+
+    subj = vc.get("credentialSubject", {})
+
+    # 4. Trust chain: the credential must be anchored to our RIC.
+    if subj.get("ric_issuer_sov_did") != TRUSTED_RIC_DID:
+        return False, (f"RIC DID mismatch: VC has "
+                       f"{subj.get('ric_issuer_sov_did')}, "
+                       f"expected {TRUSTED_RIC_DID}")
+
+    if TRUSTED_ISSUER_DID and vc.get("issuer") != TRUSTED_ISSUER_DID:
+        return False, (f"Issuer DID mismatch: VC has {vc.get('issuer')}, "
+                       f"expected {TRUSTED_ISSUER_DID}")
+
+    # 5. Holder binding: the VP signer must be the credential subject.
+    #    Without this an attacker could present someone else's credential.
+    vp_proof = vp.get("proof", {})
+    vp_vm = vp_proof.get("verificationMethod", "")
+    subject_did = subj.get("id", "")
+    if not subject_did or not vp_vm.startswith(subject_did):
+        return False, (f"Holder binding failed: VP signed by {vp_vm}, "
+                       f"credential subject is {subject_did}")
+
+    if vp_proof.get("proofPurpose") != "authentication":
+        return False, f"Wrong proofPurpose: {vp_proof.get('proofPurpose')}"
+
+    # 6. Expiry.
+    valid_until = subj.get("valid_until")
+    if valid_until:
+        now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        if now > valid_until:
+            return False, f"VC expired at {valid_until}"
+
+    # 7. Authoritative claims — produced by the verifier, not the agent.
+    claims = {
+        "xapp_name":          subj.get("xapp_name"),
+        "xapp_did":           subj.get("id"),
+        "xapp_sov_did":       subj.get("sov_did"),
+        "allowed_namespaces": parse_json_list(subj.get("allowed_namespaces", [])),
+        "permissions":        parse_json_list(subj.get("permissions", [])),
+        "ric_issuer_sov_did": subj.get("ric_issuer_sov_did"),
+        "schema_id":          subj.get("schema_id"),
+        "cred_def_id":        subj.get("cred_def_id"),
+        "valid_until":        valid_until,
+    }
+    return True, claims
+
+
+# ── HTTP API ──────────────────────────────────────────────────────────────────
+class VerifierHandler(BaseHTTPRequestHandler):
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _json(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_body(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        if length == 0:
+            return {}
+        return json.loads(self.rfile.read(length))
+
+    def do_GET(self):
+        if self.path == "/healthz":
+            self._json(200, {"status": "ok", "pending_nonces": NONCES.size()})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        try:
+            if self.path == "/challenge":
+                self.handle_challenge()
+            elif self.path == "/verify":
+                self.handle_verify()
+            else:
+                self._json(404, {"error": "not found"})
+        except Exception as e:
+            print(f"[VERIFIER] Handler error: {e}")
+            self._json(500, {"error": str(e)})
+
+    def handle_challenge(self):
+        body = self._read_body()
+        cid, nonce = NONCES.issue(body.get("xapp_name"))
+        self._json(200, {
+            "challenge_id": cid,
+            "nonce": nonce,
+            "domain": EXPECTED_DOMAIN,
+            "expires_in": NONCE_TTL_SECONDS,
+        })
+
+    def handle_verify(self):
+        t0 = time.perf_counter()
+        body = self._read_body()
+
+        cid = body.get("challenge_id")
+        vp  = body.get("vp")
+
+        if not cid or not vp:
+            self._json(400, {"verified": False,
+                             "reason": "challenge_id and vp required"})
+            return
+
+        # Consume the nonce. Unknown, already-used or expired challenges
+        # are rejected here — this is the replay defence.
+        expected_nonce = NONCES.consume(cid)
+        if expected_nonce is None:
+            print(f"[VERIFIER] DENY: unknown/used/expired challenge {cid}")
+            self._json(403, {"verified": False,
+                             "reason": "challenge unknown, already used, or expired"})
+            return
+
+        vp_str = vp if isinstance(vp, str) else json.dumps(vp)
+        ok, result = verify_vp_and_extract(vp_str, expected_nonce)
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+
+        if not ok:
+            print(f"[VERIFIER] DENY ({elapsed_ms:.1f}ms): {result}")
+            self._json(403, {"verified": False, "reason": result})
+            return
+
+        # Pipeline the next challenge so steady state costs one round trip.
+        next_cid, next_nonce = NONCES.issue(result.get("xapp_name"))
+
+        print(f"[VERIFIER] OK ({elapsed_ms:.1f}ms): "
+              f"{result.get('xapp_name')} / {result.get('xapp_did')}")
+
+        self._json(200, {
+            "verified": True,
+            "claims": result,
+            "verify_ms": round(elapsed_ms, 2),
+            "next_challenge": {
+                "challenge_id": next_cid,
+                "nonce": next_nonce,
+                "domain": EXPECTED_DOMAIN,
+                "expires_in": NONCE_TTL_SECONDS,
+            },
+        })
+
+
+if __name__ == "__main__":
+    print("[VERIFIER] VP Verifier Service starting")
+    print(f"[VERIFIER] Trusted RIC DID : {TRUSTED_RIC_DID}")
+    print(f"[VERIFIER] Trusted Issuer  : {TRUSTED_ISSUER_DID or '(not pinned)'}")
+    print(f"[VERIFIER] Nonce TTL       : {NONCE_TTL_SECONDS}s, single-use")
+    print(f"[VERIFIER] Listening on    : 0.0.0.0:{LISTEN_PORT}")
+    server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), VerifierHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.server_close()
+        print("[VERIFIER] Stopped")
+```
+The verifier reuses the Auth Agent image, since that image already carries DIDKit and requests. The script is shipped as a ConfigMap so no new image build is required:
+
+```bash
+kubectl create configmap vp-verifier-code \
+  --from-file=verifier.py=vp-verifier/verifier.py \
+  -n ricplt \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+Create vp-verifier/deployment.yaml:
+```bash
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vp-verifier
+  namespace: ricplt
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vp-verifier
+  template:
+    metadata:
+      labels:
+        app: vp-verifier
+    spec:
+      containers:
+      - name: verifier
+        image: ashank2001/auth-agent:did-vc-v3
+        command: ["python", "-u", "/app/verifier.py"]
+        env:
+        - name: RIC_DID
+          valueFrom:
+            configMapKeyRef:
+              name: ric-vc-config
+              key: RIC_DID
+        - name: NONCE_TTL_SECONDS
+          value: "30"
+        - name: VP_DOMAIN
+          value: "ric.internal"
+        - name: LISTEN_PORT
+          value: "8080"
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: verifier-code
+          mountPath: /app/verifier.py
+          subPath: verifier.py
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 30
+      volumes:
+      - name: verifier-code
+        configMap:
+          name: vp-verifier-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vp-verifier
+  namespace: ricplt
+spec:
+  selector:
+    app: vp-verifier
+  ports:
+  - port: 8080
+    targetPort: 8080
+```
+Deploy and confirm:
+
+```bash
+kubectl apply -f vp-verifier/deployment.yaml
+kubectl rollout status deployment/vp-verifier -n ricplt
+kubectl logs -n ricplt deployment/vp-verifier --tail=10
+```
+
+## Auth Agent v3 (Holder-only)
+Auth Agent v3 supersedes the v2 agent from Phase 5. The verify_did_ownership() function is removed entirely — the agent no longer verifies its own presentations. It gains fetch_challenge(), take_challenge(), construct_vp() and prove_identity(), and takes its authorization claims from the verifier's response rather than from local parsing. Local claim extraction is retained for startup diagnostics only.
+
+The startup VC check (verify_vc_at_startup) is kept as a fail-fast: a pod whose credential is invalid or whose issuer chain is wrong refuses to serve any request, without needing to consult the verifier.
+
+Replace auth-agent-v2/agent.py with:
+
+```bash
+import os
+import sys
+import json
+import time
+import asyncio
+import inspect
+import threading
+import requests
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+sys.stdout.reconfigure(line_buffering=True)
+
+# ── Config ────────────────────────────────────────────────────────────────────
+WALLET_PATH = os.environ.get("WALLET_PATH", "/wallet")
+XAPP_NAME   = os.environ.get("XAPP_NAME", "unknown-xapp")
+
+OPA_HOST     = os.environ.get("OPA_HOST", "opa-service.ricplt.svc.cluster.local")
+OPA_REST_URL = f"http://{OPA_HOST}:8181/v1/data/envoy/authz"
+
+TRUSTED_RIC_DID = os.environ.get("RIC_DID", "KewdxLKBU9Fgu5aac8PH4R")
+
+# External VP Verifier. The agent no longer verifies its own presentations.
+VERIFIER_URL = os.environ.get(
+    "VERIFIER_URL",
+    "http://vp-verifier.ricplt.svc.cluster.local:8080"
+)
+
+# Challenge pipelined by the verifier on the previous response, so steady
+# state costs one round trip instead of two.
+_CHALLENGE_LOCK = threading.Lock()
+_NEXT_CHALLENGE = None
+
+
+# ── DIDKit wrapper for DIDKit 0.3.3 ───────────────────────────────────────────
+def didkit_call(fn, *args):
+    async def runner():
+        result = fn(*args)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
+    return asyncio.run(runner())
+
+
+# ── Helper functions ──────────────────────────────────────────────────────────
+def read_json_file(path):
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def did_key_vm(did):
+    fragment = did.split(":")[-1]
+    return f"{did}#{fragment}"
+
+
+def parse_json_list(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return [v.strip() for v in value.split(",") if v.strip()]
+    return []
+
+
+# ── Load wallet at startup ────────────────────────────────────────────────────
+def load_wallet():
+    did_path    = os.path.join(WALLET_PATH, "did.json")
+    vc_path     = os.path.join(WALLET_PATH, "vc.json")
+    issuer_path = os.path.join(WALLET_PATH, "issuer.json")
+
+    for p in (did_path, vc_path, issuer_path):
+        if not os.path.exists(p):
+            print(f"[AGENT] ERROR: Missing {p}")
+            return None, None, None, None
+
+    did_data    = read_json_file(did_path)
+    vc_data     = read_json_file(vc_path)
+    issuer_data = read_json_file(issuer_path)
+
+    xapp_jwk = did_data.get("jwk")
+    if not xapp_jwk:
+        print("[AGENT] ERROR: xApp private JWK missing in did.json")
+        return None, None, None, None
+
+    if "jwk" in issuer_data or "issuer_jwk" in issuer_data:
+        print("[AGENT] ERROR: issuer.json contains issuer private key. Unsafe wallet.")
+        return None, None, None, None
+
+    print("[AGENT] Wallet loaded")
+    print(f"[AGENT] xApp DID       : {did_data.get('did')}")
+    print(f"[AGENT] xApp Sov DID   : {did_data.get('sov_did')}")
+    print(f"[AGENT] RIC Issuer DID : {issuer_data.get('issuer_did')}")
+    print(f"[AGENT] RIC Sov DID    : {issuer_data.get('ric_sov_did')}")
+    print(f"[AGENT] Trusted RIC DID: {TRUSTED_RIC_DID}")
+
+    return did_data, vc_data, issuer_data, xapp_jwk
+
+
+# ── Verify VC at startup (fail-fast integrity check) ──────────────────────────
+def verify_vc_at_startup():
+    if DID_DATA is None or VC_DATA is None or ISSUER_DATA is None:
+        return False
+
+    try:
+        import didkit
+
+        vc_issuer      = VC_DATA.get("issuer")
+        trusted_issuer = ISSUER_DATA.get("issuer_did")
+
+        if vc_issuer != trusted_issuer:
+            print("[AGENT] ERROR: VC issuer mismatch")
+            print(f"[AGENT] VC issuer      : {vc_issuer}")
+            print(f"[AGENT] Trusted issuer : {trusted_issuer}")
+            return False
+
+        if ISSUER_DATA.get("ric_sov_did") != TRUSTED_RIC_DID:
+            print("[AGENT] ERROR: issuer.json RIC DID mismatch")
+            return False
+
+        subj = VC_DATA.get("credentialSubject", {})
+        if subj.get("ric_issuer_sov_did") != TRUSTED_RIC_DID:
+            print("[AGENT] ERROR: VC subject RIC DID mismatch")
+            return False
+
+        vc_xapp_name = subj.get("xapp_name")
+        if XAPP_NAME != "unknown-xapp" and vc_xapp_name != XAPP_NAME:
+            print("[AGENT] ERROR: VC xApp name mismatch")
+            print(f"[AGENT] VC xApp name  : {vc_xapp_name}")
+            print(f"[AGENT] Env XAPP_NAME : {XAPP_NAME}")
+            return False
+
+        verify_result = json.loads(didkit_call(
+            didkit.verify_credential,
+            json.dumps(VC_DATA),
+            "{}",
+        ))
+
+        if verify_result.get("errors"):
+            print(f"[AGENT] ERROR: VC verification failed: {verify_result['errors']}")
+            return False
+
+        print("[AGENT] VC issuer, RIC DID, xApp name, and signature verified")
+        return True
+
+    except Exception as e:
+        print(f"[AGENT] VC startup verification error: {e}")
+        return False
+
+
+# ── Local claim extraction (diagnostics only, NOT authoritative) ──────────────
+def extract_claims():
+    try:
+        subj = VC_DATA.get("credentialSubject", {})
+
+        valid_until = subj.get("valid_until")
+        if valid_until:
+            now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            if now > valid_until:
+                print(f"[AGENT] VC expired at {valid_until}")
+                return None
+
+        return {
+            "xapp_name":          subj.get("xapp_name", XAPP_NAME),
+            "xapp_did":           subj.get("id"),
+            "xapp_sov_did":       subj.get("sov_did"),
+            "allowed_namespaces": parse_json_list(subj.get("allowed_namespaces", [])),
+            "permissions":        parse_json_list(subj.get("permissions", [])),
+            "ric_issuer_sov_did": subj.get("ric_issuer_sov_did"),
+            "schema_id":          subj.get("schema_id"),
+            "cred_def_id":        subj.get("cred_def_id"),
+            "valid_until":        valid_until,
+        }
+
+    except Exception as e:
+        print(f"[AGENT] Claim extraction error: {e}")
+        return None
+
+
+# ── Challenge handling ────────────────────────────────────────────────────────
+def fetch_challenge():
+    """Request a fresh single-use nonce from the external verifier."""
+    resp = requests.post(
+        f"{VERIFIER_URL}/challenge",
+        json={"xapp_name": XAPP_NAME},
+        timeout=2,
+    )
+    resp.raise_for_status()
+    d = resp.json()
+    return {"challenge_id": d["challenge_id"], "nonce": d["nonce"]}
+
+
+def take_challenge():
+    """Consume the pipelined challenge if present, otherwise fetch one."""
+    global _NEXT_CHALLENGE
+    with _CHALLENGE_LOCK:
+        if _NEXT_CHALLENGE is not None:
+            ch = _NEXT_CHALLENGE
+            _NEXT_CHALLENGE = None
+            return ch
+    return fetch_challenge()
+
+
+def store_next_challenge(ch):
+    global _NEXT_CHALLENGE
+    with _CHALLENGE_LOCK:
+        _NEXT_CHALLENGE = ch
+
+
+# ── Holder role: construct and sign the VP ────────────────────────────────────
+def construct_vp(nonce):
+    """
+    Holder role only. Signs the VP with the xApp private key.
+    This agent never verifies its own signature.
+    """
+    import didkit
+
+    xapp_did = DID_DATA.get("did")
+    if not xapp_did or not XAPP_JWK:
+        raise RuntimeError("Missing xApp DID or private JWK")
+
+    vp = {
+        "@context": [
+            "https://www.w3.org/2018/credentials/v1",
+            "https://w3id.org/security/suites/ed25519-2020/v1",
+        ],
+        "type": ["VerifiablePresentation"],
+        "holder": xapp_did,
+        "verifiableCredential": [VC_DATA],
+    }
+
+    proof_options = {
+        "type": "Ed25519Signature2020",
+        "verificationMethod": did_key_vm(xapp_did),
+        "proofPurpose": "authentication",
+        "challenge": nonce,
+        "domain": "ric.internal",
+    }
+
+    return didkit_call(
+        didkit.issue_presentation,
+        json.dumps(vp),
+        json.dumps(proof_options),
+        XAPP_JWK,
+    )
+
+
+def prove_identity():
+    """
+    Full challenge-response against the external verifier.
+    Returns (ok, claims_or_reason, verify_ms).
+    """
+    try:
+        ch = take_challenge()
+    except Exception as e:
+        return False, f"challenge fetch failed: {e}", None
+
+    try:
+        signed_vp = construct_vp(ch["nonce"])
+    except Exception as e:
+        return False, f"VP construction failed: {e}", None
+
+    try:
+        resp = requests.post(
+            f"{VERIFIER_URL}/verify",
+            json={"challenge_id": ch["challenge_id"], "vp": signed_vp},
+            timeout=3,
+        )
+    except Exception as e:
+        return False, f"verifier unreachable: {e}", None
+
+    if resp.status_code != 200:
+        try:
+            reason = resp.json().get("reason", resp.text)
+        except Exception:
+            reason = resp.text
+        return False, f"verifier rejected: {reason}", None
+
+    data = resp.json()
+    if not data.get("verified"):
+        return False, data.get("reason", "unknown"), None
+
+    nxt = data.get("next_challenge")
+    if nxt:
+        store_next_challenge({
+            "challenge_id": nxt["challenge_id"],
+            "nonce": nxt["nonce"],
+        })
+
+    return True, data["claims"], data.get("verify_ms")
+
+
+# ── Query OPA via REST ────────────────────────────────────────────────────────
+def query_opa_rest(claims, redis_command, redis_key):
+    try:
+        payload = {
+            "input": {
+                "attributes": {
+                    "request": {
+                        "http": {
+                            "headers": {
+                                "x-app-name": claims.get("xapp_name", "UNKNOWN"),
+                                "x-app-did": claims.get("xapp_did", "UNKNOWN"),
+                                "x-sdl-action": redis_command,
+                                "x-sdl-key": redis_key,
+                                "x-vc-verified": "true",
+                                "x-permissions": ",".join(claims.get("permissions", [])),
+                                "x-allowed-namespaces": ",".join(claims.get("allowed_namespaces", []))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        resp = requests.post(OPA_REST_URL, json=payload, timeout=2)
+        if resp.status_code == 200:
+            return resp.json().get("result", {}).get("allow", False)
+        print(f"[AGENT] OPA returned HTTP {resp.status_code}: {resp.text}")
+        return False
+
+    except Exception as e:
+        print(f"[AGENT] OPA REST query error: {e}")
+        return False
+
+
+# ── Startup ───────────────────────────────────────────────────────────────────
+print(f"[AGENT] Starting Auth Agent for {XAPP_NAME}")
+print(f"[AGENT] External VP Verifier: {VERIFIER_URL}")
+
+DID_DATA, VC_DATA, ISSUER_DATA, XAPP_JWK = load_wallet()
+
+VC_STARTUP_OK = False
+if DID_DATA is not None and VC_DATA is not None and ISSUER_DATA is not None:
+    VC_STARTUP_OK = verify_vc_at_startup()
+
+if VC_STARTUP_OK:
+    print("[AGENT] DID/VC startup verification passed")
+    _local = extract_claims()
+    if _local:
+        print(f"[AGENT] Local claims (diagnostic only): "
+              f"ns={_local.get('allowed_namespaces')} "
+              f"perms={_local.get('permissions')}")
+else:
+    print("[AGENT] DID/VC startup verification failed. All requests will be denied.")
+
+
+# ── HTTP Request Handler ──────────────────────────────────────────────────────
+class AuthHandler(BaseHTTPRequestHandler):
+
+    def log_message(self, format, *args):
+        pass
+
+    def do_POST(self):
+        t_start   = time.perf_counter()
+        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        redis_command = self.headers.get("x-redis-command", "UNKNOWN")
+        redis_key     = self.headers.get("x-redis-key", "UNKNOWN")
+
+        print(f"\n[AGENT] [{timestamp}] Auth Check | CMD: {redis_command} | KEY: {redis_key}")
+
+        if not VC_STARTUP_OK:
+            self.send_error_response(403, "VC Verification Failed at Startup")
+            return
+
+        # Challenge-response with the external verifier.
+        # Authorization claims come from the verifier, never from local parsing.
+        ok, result, verify_ms = prove_identity()
+        if not ok:
+            self.send_error_response(403, f"VP Challenge-Response Failed: {result}")
+            return
+
+        claims = result
+        vm_str = f" (verifier {verify_ms}ms)" if verify_ms is not None else ""
+        print(f"[AGENT] Identity proven to external verifier{vm_str}: "
+              f"{claims.get('xapp_name')} ({claims.get('xapp_did')})")
+
+        if query_opa_rest(claims, redis_command, redis_key):
+            total_ms = (time.perf_counter() - t_start) * 1000
+            print(f"[AGENT] OPA Check Passed. 200 OK. Total {total_ms:.1f}ms")
+            self.send_response(200)
+            self.end_headers()
+        else:
+            self.send_error_response(403, "OPA Policy Denied")
+
+    def send_error_response(self, code, msg):
+        print(f"[AGENT] DENY: {msg}")
+        self.send_response(code)
+        self.end_headers()
+        self.wfile.write(msg.encode("utf-8"))
+
+
+if __name__ == "__main__":
+    print("[AGENT] Auth Agent DID/VC HTTP Server started on port 50051")
+    server = ThreadingHTTPServer(("0.0.0.0", 50051), AuthHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[AGENT] Shutdown requested by user")
+        server.server_close()
+        print("[AGENT] Auth Agent stopped cleanly")
+```
+Because Kyverno mounts agent.py from the zerotrust-sidecar-configs ConfigMap over /app/agent.py, the running code comes from the ConfigMap, not the image. Updating the agent therefore requires updating the ConfigMap, not rebuilding the image — the image only needs didkit and requests present:
+
+```bash
+kubectl get configmap zerotrust-sidecar-configs -n ricxapp -o json > /tmp/cm.json
+
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+cm = json.load(open("/tmp/cm.json"))
+cm.setdefault("data", {})
+cm["data"]["agent.py"] = Path(
+    "auth-agent-v2/agent.py").read_text()
+
+for k in ["creationTimestamp", "resourceVersion", "uid", "managedFields"]:
+    cm["metadata"].pop(k, None)
+
+json.dump(cm, open("/tmp/cm-updated.json", "w"), indent=2)
+print("[+] agent.py updated inside ConfigMap")
+PY
+
+kubectl apply -f /tmp/cm-updated.json
+
+# Confirm the new code landed
+kubectl get configmap zerotrust-sidecar-configs -n ricxapp \
+  -o jsonpath='{.data.agent\.py}' | grep -c "prove_identity"
+```
+## Kyverno Update
+The inject-sidecars rule from Phase 6 gains one environment variable on the auth-agent container. Everything else in the policy is unchanged:
+
+```bash
+- name: auth-agent
+            image: ashank2001/auth-agent:did-vc-v3
+            imagePullPolicy: Always
+            env:
+            - name: XAPP_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['app']
+            - name: WALLET_PATH
+              value: /wallet
+            - name: VERIFIER_URL
+              value: "http://vp-verifier.ricplt.svc.cluster.local:8080"
+            - name: RIC_DID
+              valueFrom:
+                configMapKeyRef:
+                  name: ric-vc-config
+                  key: RIC_DID
+```
+Two operational notes:
+
+ric-vc-config lives in ricplt, but ConfigMaps are namespace-scoped and the xApp pod runs in ricxapp. The RIC_DID reference above will leave the pod in CreateContainerConfigError unless the ConfigMap is also present in ricxapp. Either copy it, or omit the RIC_DID block and let the agent fall back to its compiled-in default:
+
+```bash
+kubectl get configmap ric-vc-config -n ricplt -o yaml \
+  | sed 's/namespace: ricplt/namespace: ricxapp/' \
+  | grep -v 'resourceVersion:\|uid:\|creationTimestamp:' \
+  | kubectl apply -f -
+```
+If the deployed policy already mounts the Redis WASM filter into Envoy, that volume and mount must be preserved when editing. Applying a policy that omits wasm-filter-volume causes Envoy to fail config validation and enter CrashLoopBackOff. Pull the live policy before editing rather than applying an older local copy
+
+
+```bash
+kubectl get clusterpolicy touchless-xapp-security -o yaml > kyverno-live.yaml
+```
+Apply and recreate the pod:
+```bash
+kubectl apply -f kyverno-v2.yaml
+kubectl delete pod -l app=ricxapp-sdl-xapp -n ricxapp
+```
+
+## Validation
+Confirm the agent is running the new code and reaching the verifier:
+```bash
+POD=$(kubectl get pod -n ricxapp -l app=ricxapp-sdl-xapp \
+  -o jsonpath='{.items[0].metadata.name}')
+
+kubectl exec -n ricxapp $POD -c auth-agent -- grep -c "prove_identity" /app/agent.py
+kubectl exec -n ricxapp $POD -c auth-agent -- env | grep VERIFIER_URL
+kubectl logs -n ricxapp $POD -c auth-agent --tail=15
+```
+During SDL traffic, each request produces a matched pair across the two logs. The verifier line is the evidence that a separate process, holding no xApp key material, performed the check:
+
+```bash
+kubectl logs -n ricxapp $POD -c auth-agent -f
+kubectl logs -n ricplt deployment/vp-verifier -f
+```
+
+## Security Properties After Phase 9
+The verifier holds no xApp private key, so a valid VP proof demonstrates that the presenter controls the key bound to credentialSubject.id — this is a genuine proof of possession rather than a self-attestation. The nonce is generated by the verifier, is single-use, and expires after a bounded TTL, so a captured presentation cannot be replayed. Holder binding is checked explicitly: the VP's verificationMethod must belong to the credential subject, which prevents an attacker presenting a credential issued to a different 
+xApp. The credential signature is re-verified by the verifier rather than taken on trust from the agent, and the authorization claims forwarded to OPA are produced by the verifier, so a compromised agent cannot inflate its own permissions.
