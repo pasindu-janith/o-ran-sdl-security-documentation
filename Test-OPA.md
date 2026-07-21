@@ -53,7 +53,12 @@ spec:
   ports:
   - name: grpc
     port: 9191
+    protocol: TCP
     targetPort: 9191
+  - name: http
+    port: 8181
+    protocol: TCP
+    targetPort: 8181
 
 ```
 
