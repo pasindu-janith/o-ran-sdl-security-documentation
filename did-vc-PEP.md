@@ -498,31 +498,25 @@ CMD ["python3", "/app/agent.py"]
 Create `agent.py`:
 ```python
 import os
+import sys
 import json
 import time
-import grpc
 import asyncio
 import inspect
+import requests
 from datetime import datetime
-from concurrent import futures
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import envoy.service.auth.v3.external_auth_pb2 as auth_pb2
-import envoy.service.auth.v3.external_auth_pb2_grpc as auth_pb2_grpc
-import envoy.service.auth.v3.attribute_context_pb2 as attribute_context_pb2
-from envoy.type.v3 import http_status_pb2 as http_status_pb2
-
-try:
-    from google.rpc import status_pb2 as google_status_pb2
-    from google.rpc import code_pb2 as google_code_pb2
-except Exception:
-    google_status_pb2 = None
-    google_code_pb2 = None
-
+# Force Python to flush standard output immediately for real-time Kubernetes logs
+sys.stdout.reconfigure(line_buffering=True)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 WALLET_PATH = os.environ.get("WALLET_PATH", "/wallet")
-OPA_GRPC_URL = os.environ.get("OPA_GRPC_URL", "opa-service.ricplt.svc.cluster.local:9191")
 XAPP_NAME = os.environ.get("XAPP_NAME", "unknown-xapp")
+
+# Automatically switch from the gRPC port (9191) to the REST port (8181) for OPA
+OPA_HOST = os.environ.get("OPA_HOST", "opa-service.ricplt.svc.cluster.local")
+OPA_REST_URL = f"http://{OPA_HOST}:8181/v1/data/envoy/authz"
 
 # Should come from ric-vc-config ConfigMap
 TRUSTED_RIC_DID = os.environ.get("RIC_DID", "KewdxLKBU9Fgu5aac8PH4R")
@@ -539,32 +533,6 @@ def didkit_call(fn, *args):
     return asyncio.run(runner())
 
 
-# ── Envoy deny response ───────────────────────────────────────────────────────
-def deny_response(reason="Access denied"):
-    print(f"[AGENT] DENY: {reason}")
-
-    if google_status_pb2 is not None:
-        return auth_pb2.CheckResponse(
-            status=google_status_pb2.Status(
-                code=google_code_pb2.PERMISSION_DENIED,
-                message=reason,
-            ),
-            denied_response=auth_pb2.DeniedHttpResponse(
-                status=http_status_pb2.HttpStatus(
-                    code=http_status_pb2.StatusCode.Value("Forbidden")
-                ),
-                body=reason,
-            ),
-        )
-
-    # Fallback for older generated protobuf packages
-    return auth_pb2.CheckResponse(
-        status=http_status_pb2.HttpStatus(
-            code=http_status_pb2.StatusCode.Value("Forbidden")
-        )
-    )
-
-
 # ── Helper functions ──────────────────────────────────────────────────────────
 def read_json_file(path):
     with open(path, "r") as f:
@@ -578,25 +546,6 @@ def did_key_vm(did):
     """
     fragment = did.split(":")[-1]
     return f"{did}#{fragment}"
-
-
-def action_to_permission(action):
-    """
-    Maps SDL/Redis style actions to VC permissions.
-    Adjust this later if your OPA policy uses different action names.
-    """
-    if not action:
-        return None
-
-    action = action.upper()
-
-    if action in ["GET", "READ", "MGET", "EXISTS"]:
-        return "read"
-
-    if action in ["SET", "WRITE", "POST", "PUT", "DELETE", "DEL"]:
-        return "write"
-
-    return action.lower()
 
 
 def parse_json_list(value):
@@ -797,7 +746,6 @@ def verify_did_ownership(nonce):
             print(f"[AGENT] VP verification failed: {verify_result['errors']}")
             return False
 
-        print(f"[AGENT] DID ownership verified: {xapp_did}")
         return True
 
     except Exception as e:
@@ -805,68 +753,40 @@ def verify_did_ownership(nonce):
         return False
 
 
-# ── Optional local VC permission check ────────────────────────────────────────
-def local_vc_permission_check(claims, request_headers):
-    """
-    This does a simple local pre-check before OPA.
-    OPA remains the final policy decision point.
-    """
-    action = request_headers.get("x-sdl-action", "SET")
-    required_permission = action_to_permission(action)
-
-    if required_permission and required_permission not in claims["permissions"]:
-        print(f"[AGENT] VC permission check failed. Required={required_permission}, VC={claims['permissions']}")
-        return False
-
-    req_namespace = request_headers.get("x-sdl-namespace")
-
-    if req_namespace:
-        if req_namespace not in claims["allowed_namespaces"]:
-            print(f"[AGENT] VC namespace check failed. Requested={req_namespace}, VC={claims['allowed_namespaces']}")
-            return False
-
-    return True
-
-
-# ── Query OPA via gRPC ────────────────────────────────────────────────────────
-def query_opa_grpc(claims, request_headers):
+# ── Query OPA via REST ────────────────────────────────────────────────────────
+def query_opa_rest(claims, redis_command, redis_key):
     try:
-        headers = {
-            "x-app-id": claims["xapp_name"],
-            "x-sdl-action": request_headers.get("x-sdl-action", "SET"),
-            "x-vc-verified": "true",
-            "x-ric-issuer-did": ISSUER_DATA.get("issuer_did", ""),
-            "x-ric-sov-did": claims.get("ric_issuer_sov_did", ""),
-            "x-xapp-did": claims.get("xapp_did", ""),
-            "x-xapp-sov-did": claims.get("xapp_sov_did", ""),
-            "x-allowed-namespaces": ",".join(claims.get("allowed_namespaces", [])),
-            "x-permissions": ",".join(claims.get("permissions", [])),
+        # Construct payload with xapp_name, xapp_did, and VC claims
+        payload = {
+            "input": {
+                "attributes": {
+                    "request": {
+                        "http": {
+                            "headers": {
+                                "x-app-name": claims.get("xapp_name", "UNKNOWN"),
+                                "x-app-did": claims.get("xapp_did", "UNKNOWN"),
+                                "x-sdl-action": redis_command,
+                                "x-sdl-key": redis_key,
+                                "x-vc-verified": "true",
+                                "x-permissions": ",".join(claims.get("permissions", [])),
+                                "x-allowed-namespaces": ",".join(claims.get("allowed_namespaces", []))
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        # Preserve useful original request headers if present
-        for key in [":method", ":path", "x-sdl-namespace", "x-sdl-action"]:
-            if key in request_headers:
-                headers[key] = request_headers[key]
-
-        with grpc.insecure_channel(OPA_GRPC_URL) as channel:
-            stub = auth_pb2_grpc.AuthorizationStub(channel)
-            opa_request = auth_pb2.CheckRequest(
-                attributes=attribute_context_pb2.AttributeContext(
-                    request=attribute_context_pb2.AttributeContext.Request(
-                        http=attribute_context_pb2.AttributeContext.HttpRequest(
-                            headers=headers
-                        )
-                    )
-                )
-            )
-
-            opa_response = stub.Check(opa_request)
-            print("[AGENT] OPA gRPC response received")
-            return opa_response
+        resp = requests.post(OPA_REST_URL, json=payload, timeout=2)
+        if resp.status_code == 200:
+            return resp.json().get("result", {}).get("allow", False)
+        else:
+            print(f"[AGENT] OPA returned HTTP {resp.status_code}: {resp.text}")
+            return False
 
     except Exception as e:
-        print(f"[AGENT] OPA gRPC error: {e}")
-        return deny_response("OPA error")
+        print(f"[AGENT] OPA REST query error: {e}")
+        return False
 
 
 # ── Startup ───────────────────────────────────────────────────────────────────
@@ -884,52 +804,61 @@ else:
     print("[AGENT] DID/VC startup verification failed. All requests will be denied.")
 
 
-# ── gRPC Check handler ────────────────────────────────────────────────────────
-class AuthzServicer(auth_pb2_grpc.AuthorizationServicer):
+# ── HTTP Request Handler ──────────────────────────────────────────────────────
+class AuthHandler(BaseHTTPRequestHandler):
 
-    def Check(self, request, context):
+    # Suppress default HTTP logging to keep the console clean
+    def log_message(self, format, *args):
+        pass
+
+    def do_POST(self):
         timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\n[AGENT] [{timestamp}] CheckRequest for {XAPP_NAME}")
+
+        # Read the command and key injected by the Go WASM filter
+        redis_command = self.headers.get("x-redis-command", "UNKNOWN")
+        redis_key = self.headers.get("x-redis-key", "UNKNOWN")
+
+        print(f"\n[AGENT] [{timestamp}] Auth Check | CMD: {redis_command} | KEY: {redis_key}")
 
         if not VC_STARTUP_OK:
-            return deny_response("VC startup verification failed")
+            self.send_error_response(403, "VC Verification Failed at Startup")
+            return
 
-        request_headers = dict(request.attributes.request.http.headers)
-
-        # Step 1: Extract and validate VC claims
         claims = extract_claims()
         if claims is None:
-            return deny_response("Invalid or expired VC")
+            self.send_error_response(403, "Invalid VC")
+            return
 
-        print(f"[AGENT] VC claims: namespaces={claims['allowed_namespaces']} permissions={claims['permissions']}")
-
-        # Step 2: Prove xApp owns DID key using VP
         nonce = f"req-{XAPP_NAME}-{int(time.time())}"
         if not verify_did_ownership(nonce):
-            return deny_response("DID ownership verification failed")
+            self.send_error_response(403, "VP Signature Failed")
+            return
 
-        # Step 3: Simple local VC permission check
-        if not local_vc_permission_check(claims, request_headers):
-            return deny_response("VC permission check failed")
+        print(f"[AGENT] Cryptography verified for {claims.get('xapp_name')} ({claims.get('xapp_did')}). Offloading to OPA...")
 
-        # Step 4: OPA final decision
-        print(f"[AGENT] DID/VC verified. Querying OPA for {claims['xapp_name']}...")
-        return query_opa_grpc(claims, request_headers)
+        # Hand off directly to OPA without any local namespace checks
+        if query_opa_rest(claims, redis_command, redis_key):
+            print("[AGENT] OPA Check Passed. Returning 200 OK.")
+            self.send_response(200)
+            self.end_headers()
+        else:
+            self.send_error_response(403, "OPA Policy Denied")
+
+    def send_error_response(self, code, msg):
+        print(f"[AGENT] DENY: {msg}")
+        self.send_response(code)
+        self.end_headers()
+        self.wfile.write(msg.encode("utf-8"))
 
 
 if __name__ == "__main__":
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=5))
-    auth_pb2_grpc.add_AuthorizationServicer_to_server(AuthzServicer(), server)
-    server.add_insecure_port("[::]:50051")
-
-    print("[AGENT] Auth Agent DID/VC mode started on port 50051")
-    server.start()
-
+    print("[AGENT] Auth Agent DID/VC HTTP Server started on port 50051")
+    server = HTTPServer(("0.0.0.0", 50051), AuthHandler)
     try:
-        server.wait_for_termination()
+        server.serve_forever()
     except KeyboardInterrupt:
         print("\n[AGENT] Shutdown requested by user")
-        server.stop(0)
+        server.server_close()
         print("[AGENT] Auth Agent stopped cleanly")
 ```
 
@@ -940,6 +869,92 @@ sudo docker build -t ashank2001/auth-agent:v2 .
 sudo docker push ashank2001/auth-agent:v2
 ```
 
+# Phase 6: OPA Policy (Reused, Unchanged from the Localized PEP Approach)
+
+No DID/VC-specific Rego policy was written for this testbed. OPA still runs the exact same `opa-policy.yaml` deployed for the JWT-based approach (see `Test-OPA.md`) — the `opa-pdp` Deployment and `opa-policy` ConfigMap were not touched:
+```bash
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opa-policy
+  namespace: ricplt
+data:
+  policy.rego: |
+    package envoy.authz
+
+    import rego.v1
+
+    # 1. Default to DENY (Fail-Closed)
+    default allow := false
+
+    # 2. Hardcoded Configuration (Centralized Governance)
+    # xApp Name -> List of allowed namespaces
+    allowed_namespaces := {
+        "ricxapp-sdl-xapp": ["e2-metrics", "kpi-store", "ue-metrics"],
+        "ts-xapp": ["e2-metrics"],
+        "rx-xapp": ["kpi-store"]
+    }
+
+    # xApp Name -> Roles
+    xapp_roles := {
+        "ricxapp-sdl-xapp": ["writer"],
+        "ts-xapp": ["reader"],
+        "rx-xapp": ["admin"]
+    }
+
+    # Role -> Actions
+    role_permissions := {
+        "reader": ["GET", "EXISTS"],
+        "writer": ["GET", "SET", "DEL", "MGET", "MSET"],
+        "admin":  ["GET", "SET", "DEL", "FLUSHALL", "MGET"]
+    }
+
+    # 3. Main Authorization Logic
+    allow if {
+        # Verify the Auth Agent successfully validated the VC/DID
+        input.attributes.request.http.headers["x-vc-verified"] == "true"
+
+        # Extract inputs from headers sent by the Auth Agent
+        xapp_name := input.attributes.request.http.headers["x-app-name"]
+        action := input.attributes.request.http.headers["x-sdl-action"]
+        raw_key := input.attributes.request.http.headers["x-sdl-key"]
+
+        # 4. Parse Namespace (Safely handle Redis Hash Tags)
+        requested_ns := extract_namespace(raw_key)
+
+        # 5. Namespace Validation
+        allowed_list := allowed_namespaces[xapp_name]
+        allowed_list[_] == requested_ns
+
+        # 6. Role/Permission Validation
+        roles := xapp_roles[xapp_name]
+        role := roles[_]
+        perms := role_permissions[role]
+        perms[_] == action
+    }
+
+    # Helper to safely extract namespace from Redis Hash Tags
+    # e.g., "{ue-metrics},ue_12345_metrics" -> "ue-metrics"
+    extract_namespace(key) := ns if {
+        contains(key, "{")
+        contains(key, "}")
+        ns := split(split(key, "}")[0], "{")[1]
+    } else := "default"
+
+```
+
+This means the ABAC decision is still made against the **static `xapp_roles` / `role_permissions` table**, keyed only on `x-app-id` and `x-sdl-action` — the same two headers OPA consumed under the Localized PEP approach. `query_opa_grpc` in Phase 5 forwards a richer set of headers derived from the verified VC (`x-vc-verified`, `x-ric-sov-did`, `x-xapp-did`, `x-permissions`, `x-allowed-namespaces`), but the current Rego policy does not read any of them — they pass through unused. The only enforcement of VC-derived permissions/namespaces happening today is `local_vc_permission_check()` inside the Auth Agent itself (Phase 5, Step 3), before OPA is ever called. Making OPA evaluate the VC claims directly (as opposed to the static role table) is future work, not something implemented in this testbed.
+
+Verify OPA is reachable and returns the expected decision for the existing policy:
+```bash
+sudo kubectl port-forward deployment/opa-pdp 8181:8181 -n ricplt
+
+curl -X POST http://localhost:8181/v1/data/envoy/authz \
+  -H "Content-Type: application/json" \
+  -d '{"input":{"attributes":{"request":{"http":{"headers":{"x-app-id":"ricxapp-sdl-xapp","x-sdl-action":"SET"}}}}}}'
+```
+
+# Phase 7: Kyverno Wallet Injection
 
 
 # Phase 6: Kyverno Wallet Injection
