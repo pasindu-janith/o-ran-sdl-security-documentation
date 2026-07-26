@@ -495,7 +495,8 @@ RUN python3 -c "import didkit; print('DIDKit installed OK')"
 CMD ["python3", "/app/agent.py"]
 ```
 
-Create `agent.py`:
+Create `agent.py` (The updated auth-agent code is given at next sections. This agent code is depreciated due to local DID verification at xApp pod):
+
 ```python
 import os
 import sys
@@ -869,201 +870,210 @@ sudo docker build -t ashank2001/auth-agent:v2 .
 sudo docker push ashank2001/auth-agent:v2
 ```
 
-# Phase 6: OPA Policy (Reused, Unchanged from the Localized PEP Approach)
+# Phase 6: Add WASM Network Filter for Parse Redis Payload
+the xApp communicates with the SDL using the raw Redis Serialization Protocol (RESP) over a pure TCP connection, Envoy’s HTTP filters are completely blind to the payload. To achieve Zero Trust down to the payload level for raw TCP, you must use a WebAssembly (WASM) Network Filter. Since we know Envoy's native network ext_authz filter is broken when it comes to passing metadata, we can use the Go WASM filter to bypass it entirely.
 
-No DID/VC-specific Rego policy was written for this testbed. OPA still runs the exact same `opa-policy.yaml` deployed for the JWT-based approach (see `Test-OPA.md`) — the `opa-pdp` Deployment and `opa-policy` ConfigMap were not touched:
+Here is the architecture we will implement:
+
+The Go WASM Filter: Intercepts the raw TCP RESP stream, extracts the Redis command and key, pauses the stream, and directly makes an HTTP POST request to your Python sidecar. The Python Agent: Replaces the complex gRPC setup with a simple HTTP server to receive the data, verify the DID/VC, and reply with a 200 OK or 403 Forbidden. Here is how to build this stack.
+
+## The Go WASM Filter
+First, set up your Go project and install the SDK on your Ubuntu host:
+```go
+package main
+
+import (
+	"strings"
+
+	"github.com/tetratelabs/proxy-wasm-go-sdk/proxywasm"
+	"github.com/tetratelabs/proxy-wasm-go-sdk/proxywasm/types"
+)
+
+func main() {
+	proxywasm.SetVMContext(&vmContext{})
+}
+
+type vmContext struct {
+	types.DefaultVMContext
+}
+
+func (*vmContext) NewPluginContext(contextID uint32) types.PluginContext {
+	return &pluginContext{}
+}
+
+type pluginContext struct {
+	types.DefaultPluginContext
+}
+
+func (*pluginContext) NewTcpContext(contextID uint32) types.TcpContext {
+	return &redisGatekeeperContext{}
+}
+
+type redisGatekeeperContext struct {
+	types.DefaultTcpContext
+}
+
+func (ctx *redisGatekeeperContext) OnDownstreamData(dataSize int, endOfStream bool) types.Action {
+
+
+	data, err := proxywasm.GetDownstreamData(0, dataSize)
+	
+	if err != nil && err != types.ErrorStatusNotFound {
+		proxywasm.LogErrorf("Failed to read TCP data: %v", err)
+		return types.ActionContinue
+	}
+
+	payload := string(data)
+	lines := strings.Split(payload, "\r\n")
+
+	// Basic RESP parsing for an Array containing the command and key
+	if len(lines) >= 5 && strings.HasPrefix(lines[0], "*") {
+		command := strings.ToUpper(lines[2])
+		key := lines[4]
+
+		proxywasm.LogInfof("Go WASM Intercept -> CMD: %s, KEY: %s", command, key)
+
+		// Prepare HTTP headers to send to the Python sidecar
+		headers := [][2]string{
+			{":method", "POST"},
+			{":path", "/auth"},
+			{":authority", "auth-agent"},
+			{"x-redis-command", command},
+			{"x-redis-key", key},
+		}
+
+		// Dispatch an asynchronous HTTP call to the Python Agent
+		_, err := proxywasm.DispatchHttpCall(
+			"auth_agent_cluster",
+			headers,
+			nil,
+			nil,
+			5000,
+			func(numHeaders, bodySize, numTrailers int) {
+				respHeaders, err := proxywasm.GetHttpCallResponseHeaders()
+				if err != nil {
+					proxywasm.LogErrorf("Failed to get HTTP response: %v", err)
+
+					proxywasm.CloseDownstream()
+					return
+				}
+
+				status := "500"
+				for _, h := range respHeaders {
+					if h[0] == ":status" {
+						status = h[1]
+					}
+				}
+
+				if status == "200" {
+
+					proxywasm.ContinueTcpStream()
+				} else {
+					proxywasm.LogInfof("Auth Denied (%s). Terminating connection.", status)
+
+					proxywasm.CloseDownstream() // Drop connection
+				}
+			},
+		)
+
+		if err != nil {
+			proxywasm.LogErrorf("HTTP Dispatch failed: %v", err)
+			return types.ActionContinue
+		}
+
+		// Pause the TCP stream while we wait for the Python sidecar to respond
+		return types.ActionPause
+	}
+
+	return types.ActionContinue
+}
+```
+
+
+Compile it using TinyGo targeting the WASI architecture:
+
+```Bash
+tinygo build -o redis_parser.wasm -scheduler=none -target=wasi main.go
+```
+Upload it to your cluster exactly as before:
+
+```bash
+sudo kubectl delete configmap redis-wasm-filter -n ricxapp --ignore-not-found
+sudo kubectl create configmap redis-wasm-filter --from-file=redis_parser.wasm=redis_parser.wasm -n ricxapp
+```
+
+## Simplify the Envoy ConfigMap
+Apply the zero-trust-sidecar configMap:
 ```bash
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: opa-policy
-  namespace: ricplt
+  name: zerotrust-sidecar-configs
+  namespace: ricxapp
 data:
-  policy.rego: |
-    package envoy.authz
+  envoy.yaml: |
+    static_resources:
+      listeners:
+      - name: redis_interceptor
+        address:
+          socket_address: { address: 127.0.0.1, port_value: 6379 }
+        filter_chains:
+        - filters:
+          # 1. Go WASM Gatekeeper
+          - name: envoy.filters.network.wasm
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.network.wasm.v3.Wasm
+              config:
+                name: "redis_gatekeeper"
+                vm_config:
+                  runtime: "envoy.wasm.runtime.v8"
+                  code:
+                    local:
+                      filename: "/etc/envoy/wasm/redis_parser.wasm"
 
-    import rego.v1
+          # 2. TCP Proxy (Only reached if Go Resumes the Stream)
+          - name: envoy.filters.network.tcp_proxy
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+              stat_prefix: egress_tcp
+              cluster: real_sdl_cluster
 
-    # 1. Default to DENY (Fail-Closed)
-    default allow := false
+      clusters:
+      # Auth Agent is now standard HTTP (no http2 required)
+      - name: auth_agent_cluster
+        connect_timeout: 0.25s
+        type: STRICT_DNS
+        load_assignment:
+          cluster_name: auth_agent_cluster
+          endpoints:
+          - lb_endpoints:
+            - endpoint: 
+                address: 
+                  socket_address: { address: 127.0.0.1, port_value: 50051 }
 
-    # 2. Hardcoded Configuration (Centralized Governance)
-    # xApp Name -> List of allowed namespaces
-    allowed_namespaces := {
-        "ricxapp-sdl-xapp": ["e2-metrics", "kpi-store", "ue-metrics"],
-        "ts-xapp": ["e2-metrics"],
-        "rx-xapp": ["kpi-store"]
-    }
-
-    # xApp Name -> Roles
-    xapp_roles := {
-        "ricxapp-sdl-xapp": ["writer"],
-        "ts-xapp": ["reader"],
-        "rx-xapp": ["admin"]
-    }
-
-    # Role -> Actions
-    role_permissions := {
-        "reader": ["GET", "EXISTS"],
-        "writer": ["GET", "SET", "DEL", "MGET", "MSET"],
-        "admin":  ["GET", "SET", "DEL", "FLUSHALL", "MGET"]
-    }
-
-    # 3. Main Authorization Logic
-    allow if {
-        # Verify the Auth Agent successfully validated the VC/DID
-        input.attributes.request.http.headers["x-vc-verified"] == "true"
-
-        # Extract inputs from headers sent by the Auth Agent
-        xapp_name := input.attributes.request.http.headers["x-app-name"]
-        action := input.attributes.request.http.headers["x-sdl-action"]
-        raw_key := input.attributes.request.http.headers["x-sdl-key"]
-
-        # 4. Parse Namespace (Safely handle Redis Hash Tags)
-        requested_ns := extract_namespace(raw_key)
-
-        # 5. Namespace Validation
-        allowed_list := allowed_namespaces[xapp_name]
-        allowed_list[_] == requested_ns
-
-        # 6. Role/Permission Validation
-        roles := xapp_roles[xapp_name]
-        role := roles[_]
-        perms := role_permissions[role]
-        perms[_] == action
-    }
-
-    # Helper to safely extract namespace from Redis Hash Tags
-    # e.g., "{ue-metrics},ue_12345_metrics" -> "ue-metrics"
-    extract_namespace(key) := ns if {
-        contains(key, "{")
-        contains(key, "}")
-        ns := split(split(key, "}")[0], "{")[1]
-    } else := "default"
+      - name: real_sdl_cluster
+        connect_timeout: 0.5s
+        type: STRICT_DNS
+        load_assignment:
+          cluster_name: real_sdl_cluster
+          endpoints:
+          - lb_endpoints:
+            - endpoint: 
+                address: 
+                  socket_address: { address: service-ricplt-dbaas-tcp.ricplt.svc.cluster.local, port_value: 6380 }
+        transport_socket:
+          name: envoy.transport_sockets.tls
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+            sni: service-ricplt-dbaas-tcp.ricplt.svc.cluster.local
+            common_tls_context:
+              validation_context:
+                trusted_ca: { filename: "/etc/xapp-certs/ca.crt" }
+              tls_certificates:
+                - certificate_chain: { filename: "/etc/xapp-certs/tls.crt" }
+                  private_key: { filename: "/etc/xapp-certs/tls.key" }
 
 ```
-
-This means the ABAC decision is still made against the **static `xapp_roles` / `role_permissions` table**, keyed only on `x-app-id` and `x-sdl-action` — the same two headers OPA consumed under the Localized PEP approach. `query_opa_grpc` in Phase 5 forwards a richer set of headers derived from the verified VC (`x-vc-verified`, `x-ric-sov-did`, `x-xapp-did`, `x-permissions`, `x-allowed-namespaces`), but the current Rego policy does not read any of them — they pass through unused. The only enforcement of VC-derived permissions/namespaces happening today is `local_vc_permission_check()` inside the Auth Agent itself (Phase 5, Step 3), before OPA is ever called. Making OPA evaluate the VC claims directly (as opposed to the static role table) is future work, not something implemented in this testbed.
-
-Verify OPA is reachable and returns the expected decision for the existing policy:
-```bash
-sudo kubectl port-forward deployment/opa-pdp 8181:8181 -n ricplt
-
-curl -X POST http://localhost:8181/v1/data/envoy/authz \
-  -H "Content-Type: application/json" \
-  -d '{"input":{"attributes":{"request":{"http":{"headers":{"x-app-id":"ricxapp-sdl-xapp","x-sdl-action":"SET"}}}}}}'
-```
-
-# Phase 7: Kyverno Wallet Injection
-
-
-# Phase 6: Kyverno Wallet Injection
-
-Kyverno's mutation rule from the Localized PEP approach (`Main-Implementation.md`) is extended to also mount each xApp's `xapp-wallet-<name>` Secret into the Auth Agent container at `/wallet`, and to inject the trusted `RIC_DID` from the `ric-vc-config` ConfigMap so the agent knows what issuer DID to trust without a code change.
-
-Create `kyverno-v2.yaml`:
-```bash
-apiVersion: kyverno.io/v1
-kind: ClusterPolicy
-metadata:
-  name: touchless-xapp-security
-spec:
-  admission: true
-  background: true
-  validationFailureAction: Audit
-  rules:
-  - name: generate-tls-cert
-    match:
-      any:
-      - resources:
-          kinds:
-          - Deployment
-          namespaces:
-          - ricxapp
-    generate:
-      apiVersion: cert-manager.io/v1
-      kind: Certificate
-      name: "{{request.object.metadata.name}}-cert"
-      namespace: ricxapp
-      synchronize: true
-      data:
-        spec:
-          secretName: "{{request.object.metadata.name}}-certs"
-          commonName: "{{request.object.metadata.name}}"
-          issuerRef:
-            name: smo-root-ca
-            kind: ClusterIssuer
-
-  - name: inject-sidecars
-    match:
-      any:
-      - resources:
-          kinds:
-          - Pod
-          namespaces:
-          - ricxapp
-    mutate:
-      patchStrategicMerge:
-        spec:
-          containers:
-          - (name): "?*"
-            env:
-            - name: DBAAS_SERVICE_HOST
-              value: "127.0.0.1"
-            - name: DBAAS_SERVICE_PORT
-              value: "6379"
-
-          - name: envoy-proxy
-            image: envoyproxy/envoy:v1.28.0
-            volumeMounts:
-            - name: sidecar-configs
-              mountPath: /etc/envoy/envoy.yaml
-              subPath: envoy.yaml
-
-          - name: auth-agent
-            image: ashank2001/auth-agent:v2
-            imagePullPolicy: Always
-            env:
-            - name: XAPP_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.labels['app']
-            - name: WALLET_PATH
-              value: /wallet
-            - name: RIC_DID
-              valueFrom:
-                configMapKeyRef:
-                  name: ric-vc-config
-                  key: RIC_DID
-            volumeMounts:
-            - name: sidecar-configs
-              mountPath: /app/agent.py
-              subPath: agent.py
-            - name: xapp-tls-volume
-              mountPath: /etc/xapp-certs
-              readOnly: true
-            - name: xapp-wallet
-              mountPath: /wallet
-              readOnly: true
-
-          volumes:
-          - name: sidecar-configs
-            configMap:
-              name: zerotrust-sidecar-configs
-          - name: xapp-tls-volume
-            secret:
-              secretName: "{{request.object.metadata.labels.app}}-certs"
-          - name: xapp-wallet
-            secret:
-              secretName: "xapp-wallet-{{request.object.metadata.labels.app}}"
-```
-
-Apply it to the cluster:
-```bash
-sudo kubectl apply -f kyverno-v2.yaml
-```
-
-Note: Kyverno's `generate` rule for Certificates runs unconditionally on every `Deployment` in `ricxapp`, but the `xapp-wallet-<name>` Secret referenced by the `inject-sidecars` rule must already exist (it is created by the provisioner in Phase 8) **before** the xApp pod is scheduled — otherwise the pod stays in `ContainerCreating` waiting on a missing Secret volume.
 
 # Phase 7: xApp DID/VC Wallet Provisioning
 
@@ -1432,211 +1442,8 @@ Inspect the resulting Secret:
 sudo kubectl get secret xapp-wallet-ricxapp-sdl-xapp -n ricxapp -o jsonpath='{.data.vc\.json}' | base64 -d | python3 -m json.tool
 ```
 
-# Phase 8: Secure xApp Onboarding Script
 
-`secure_xapp_onboard.sh` ties Phase 8 provisioning into the same `dms_cli` onboarding flow described in `xapp-onboarding.md`, so a single command builds the xApp image, onboards it via DMS CLI, provisions its DID/VC wallet **before** the pod is created, then installs the xApp and verifies the wallet actually landed inside the Auth Agent sidecar.
 
-Create `secure_xapp_onboard.sh`:
-```bash
-#!/bin/bash
-
-set -e
-
-# Usage:
-# ./secure_xapp_onboard.sh <repo-path> <descriptor-path> <xapp-name> <version> <namespace> <allowed-namespaces> <permissions>
-#
-# Example:
-# ./secure_xapp_onboard.sh ~/custom-sdl-xapp ~/custom-sdl-xapp/descriptor sdl-xapp 1.0.1 ricxapp ue-metrics read,write
-
-REPO_PATH=$1
-DESC_PATH=$2
-XAPP_CHART_NAME=$3
-VERSION=$4
-NAMESPACE=$5
-ALLOWED_NAMESPACES=$6
-PERMISSIONS=$7
-
-if [ -z "$REPO_PATH" ] || [ -z "$DESC_PATH" ] || [ -z "$XAPP_CHART_NAME" ] || [ -z "$VERSION" ] || [ -z "$NAMESPACE" ] || [ -z "$ALLOWED_NAMESPACES" ] || [ -z "$PERMISSIONS" ]; then
-  echo "Usage:"
-  echo "./secure_xapp_onboard.sh <repo-path> <descriptor-path> <xapp-name> <version> <namespace> <allowed-namespaces> <permissions>"
-  echo
-  echo "Example:"
-  echo "./secure_xapp_onboard.sh ~/custom-sdl-xapp ~/custom-sdl-xapp/descriptor sdl-xapp 1.0.1 ricxapp ue-metrics read,write"
-  exit 1
-fi
-
-RUNTIME_XAPP_NAME="${NAMESPACE}-${XAPP_CHART_NAME}"
-IMAGE_NAME="127.0.0.1:5000/${XAPP_CHART_NAME}:${VERSION}"
-
-echo "======================================================"
-echo "[0] Secure DID/VC xApp onboarding"
-echo "Chart xApp name   : $XAPP_CHART_NAME"
-echo "Runtime xApp name : $RUNTIME_XAPP_NAME"
-echo "Version           : $VERSION"
-echo "Namespace         : $NAMESPACE"
-echo "Image             : $IMAGE_NAME"
-echo "Allowed namespaces: $ALLOWED_NAMESPACES"
-echo "Permissions       : $PERMISSIONS"
-echo "======================================================"
-
-echo
-echo "[1] Building Docker image..."
-cd "$REPO_PATH"
-sudo docker build -t "$IMAGE_NAME" .
-
-echo
-echo "[2] Pushing Docker image..."
-sudo docker push "$IMAGE_NAME"
-
-echo
-echo "[3] Running dms_cli onboard..."
-cd "$DESC_PATH"
-CHART_REPO_URL=http://127.0.0.1:8090
-
-sudo CHART_REPO_URL=$CHART_REPO_URL dms_cli onboard \
-  --config_file_path=config-file.json \
-  --shcema_file_path=schema.json | tee /tmp/dms_onboard.log
-
-if grep -qiE "Cannot connect|Service not ready|error_message|Failed to connect" /tmp/dms_onboard.log; then
-  echo "[ERROR] dms_cli onboard failed. Fix local Helm chart repo before continuing."
-  exit 1
-fi
-echo
-
-echo
-echo "[4] Checking ACA-Py admin API..."
-if ! curl -fsS http://localhost:3001/status >/dev/null; then
-  echo "[ERROR] ACA-Py admin API is not reachable at localhost:3001"
-  echo
-  echo "Open another terminal and run:"
-  echo "sudo kubectl port-forward -n ricplt svc/acapy-ric-agent 3001:3001"
-  echo
-  echo "Then rerun this script."
-  exit 1
-fi
-
-echo "[5] Provisioning DID/VC wallet before xApp install..."
-cd ~/did-vc-setup/provisioner
-python3 provision_xapp_wallet.py "$RUNTIME_XAPP_NAME" "$ALLOWED_NAMESPACES" "$PERMISSIONS"
-
-echo
-echo "[6] Verifying wallet Secret..."
-sudo kubectl get secret "xapp-wallet-${RUNTIME_XAPP_NAME}" -n "$NAMESPACE"
-
-echo
-echo "[7] Skipping uninstall. This flow keeps existing xApps running."
-
-echo
-echo "[8] Installing xApp using dms_cli..."
-sudo CHART_REPO_URL=$CHART_REPO_URL dms_cli install "$XAPP_CHART_NAME" "$VERSION" "$NAMESPACE"
-
-echo
-echo "[9] Waiting for xApp pod to appear..."
-sleep 15
-
-POD=$(sudo kubectl get pods -n "$NAMESPACE" --sort-by=.metadata.creationTimestamp \
-  | grep "$RUNTIME_XAPP_NAME" | tail -n1 | awk '{print $1}')
-
-if [ -z "$POD" ]; then
-  echo "[ERROR] No pod found for $RUNTIME_XAPP_NAME"
-  sudo kubectl get pods -n "$NAMESPACE"
-  exit 1
-fi
-
-echo "Pod: $POD"
-
-echo
-echo "[10] Waiting for pod to become Ready..."
-sudo kubectl wait --for=condition=Ready pod/"$POD" -n "$NAMESPACE" --timeout=180s || true
-
-echo
-echo "[11] Showing pod status..."
-sudo kubectl get pod "$POD" -n "$NAMESPACE"
-
-echo
-echo "[12] Showing injected containers..."
-sudo kubectl get pod "$POD" -n "$NAMESPACE" \
-  -o jsonpath='{range .spec.containers[*]}{.name}{" -> "}{.image}{"\n"}{end}'
-
-echo
-echo "[13] Verifying wallet mount inside Auth-Agent..."
-sudo kubectl exec -n "$NAMESPACE" "$POD" -c auth-agent -- ls -l /wallet || {
-  echo "[ERROR] Auth-Agent or wallet mount not found. Kyverno injection may have failed."
-  exit 1
-}
-
-echo
-echo "[14] Showing Auth-Agent logs..."
-sudo kubectl logs -n "$NAMESPACE" "$POD" -c auth-agent --tail=80
-
-echo
-echo "[15] Showing xApp logs..."
-sudo kubectl logs -n "$NAMESPACE" "$POD" -c "$XAPP_CHART_NAME" --tail=80 || true
-
-echo
-echo "======================================================"
-echo "[+] Secure DID/VC onboarding completed"
-echo "Runtime xApp name: $RUNTIME_XAPP_NAME"
-echo "Wallet Secret    : xapp-wallet-${RUNTIME_XAPP_NAME}"
-echo "Pod              : $POD"
-echo "======================================================"
-```
-
-Run it end to end:
-```bash
-chmod +x secure_xapp_onboard.sh
-./secure_xapp_onboard.sh ~/custom-sdl-xapp ~/custom-sdl-xapp/descriptor sdl-xapp 1.0.1 ricxapp e2-metrics,kpi-store read,write
-```
-
-## Request Lifecycle & Traffic Flow
-
-1. **Onboarding (one-time, out-of-band):** the operator runs `secure_xapp_onboard.sh`, which provisions the xApp's sov DID, key DID, and signed VC, and stores them as the `xapp-wallet-<name>` Secret before the xApp pod is ever scheduled.
-2. **Injection:** Kyverno mutates the incoming xApp Pod, adding the Envoy sidecar, the Auth Agent v2 sidecar, and mounting the wallet Secret at `/wallet`.
-3. **Startup verification:** on boot, the Auth Agent loads the wallet and immediately verifies the VC's signature and issuer/RIC DID chain (`verify_vc_at_startup`). If this fails, every subsequent request is denied without contacting OPA.
-4. **Initiation:** the xApp executes an SDL command; Envoy's `ext_authz` filter intercepts the TCP connection and sends a `CheckRequest` to the Auth Agent over gRPC (`:50051`).
-5. **Claim extraction:** the Auth Agent extracts and expiry-checks the plain claims (`allowed_namespaces`, `permissions`) from the already-verified VC.
-6. **Proof of possession:** the Auth Agent constructs a fresh Verifiable Presentation over the VC, signs it with the xApp's private JWK, and verifies it with DIDKit — proving the sidecar actually holds the private key bound to the credential, not just a copy of the VC JSON.
-7. **Local pre-check:** a cheap local permission/namespace check runs before bothering OPA, to short-circuit obviously-denied requests.
-8. **ABAC decision:** the Auth Agent forwards plain verified claims (`x-vc-verified: true`, `x-permissions`, `x-allowed-namespaces`, `x-ric-sov-did`, ...) to OPA over gRPC; OPA evaluates the Rego policy from Phase 6 and returns allow/deny.
-9. **Enforcement:** the Auth Agent relays OPA's decision back to Envoy as the `CheckResponse`; Envoy either forwards the TCP connection to Redis or drops it.
-
-## Known Limitations / Testbed Decisions
-- Von Network runs on the Ubuntu host via Docker Compose, not inside Kubernetes — the native `von-network-k8s.yaml` deployment was abandoned after genesis file generation timing prevented the 4-node pool from reaching consensus.
-- DIDKit is used for VC signing instead of ACA-Py's built-in W3C credential endpoint, because ACA-Py 0.10.4 with the `askar` wallet type does not expose `/vc/credentials/issue`.
-- The RIC issuer keypair (`ric-issuer.json`) is generated fresh per provisioning setup by `create_ric_issuer.py`; in a production deployment this would be persisted permanently as the RIC's signing identity and rotated deliberately rather than regenerated.
-- `did:key` is used for the xApp's VP-signing DID, kept separate from its ledger-anchored `did:sov` identity — the sov DID proves ledger registration, the key DID proves possession at runtime.
-- Full DIDComm-based credential exchange (issuer-to-holder protocol messages) is not implemented; the signed VC is delivered out-of-band by writing it directly into the xApp's wallet Secret during provisioning.
-
-## Common commands
-
-Check ACA-Py, Von Network and OPA reachability:
-```bash
-curl -s http://localhost:3001/status | python3 -m json.tool
-curl -s http://<HOST_IP>:9000/status
-sudo kubectl port-forward deployment/opa-pdp 8181:8181 -n ricplt
-```
-
-Check logs in a specific container within a specific pod:
-```bash
-sudo kubectl logs ricxapp-sdl-xapp-686946b7-765hs -c auth-agent -n ricxapp
-```
-
-Check which agent.py code is actually running inside the sidecar:
-```bash
-sudo kubectl exec ricxapp-sdl-xapp-686946b7-5wn25 -c auth-agent -n ricxapp -- cat /app/agent.py
-```
-
-Inspect a wallet Secret's contents without decoding manually:
-```bash
-sudo kubectl get secret xapp-wallet-ricxapp-sdl-xapp -n ricxapp -o json \
-  | python3 -c "import sys,json,base64; d=json.load(sys.stdin)['data']; [print(k, '=>', base64.b64decode(v)[:200]) for k,v in d.items()]"
-```
-
-Re-provision a wallet after rotating permissions for an already-onboarded xApp:
-```bash
-python3 provision_xapp_wallet.py ricxapp-sdl-xapp e2-metrics,kpi-store,ue-metrics read,write
-sudo kubectl rollout restart deployment ricxapp-sdl-xapp -n ricxapp
-```
 
 # Phase 9: External VP Verifier (Challenge–Response Hardening)
 ## Motivation
@@ -1653,7 +1460,7 @@ The verifier returns the next challenge alongside each successful verification r
 ## VP Verifier Service
 Create vp-verifier/verifier.py:
 
-```bash
+```python
 import os
 import sys
 import json
@@ -1955,7 +1762,7 @@ kubectl create configmap vp-verifier-code \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 Create vp-verifier/deployment.yaml:
-```bash
+```yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -2443,7 +2250,16 @@ if __name__ == "__main__":
         server.server_close()
         print("[AGENT] Auth Agent stopped cleanly")
 ```
-Because Kyverno mounts agent.py from the zerotrust-sidecar-configs ConfigMap over /app/agent.py, the running code comes from the ConfigMap, not the image. Updating the agent therefore requires updating the ConfigMap, not rebuilding the image — the image only needs didkit and requests present:
+
+Rebuild it and push to DockerHub:
+Build and push the image:
+```bash
+sudo docker build -t ashank2001/auth-agent:did-vc-v3 .
+sudo docker push ashank2001/auth-agent:did-vc-v3
+```
+
+
+<!-- Because Kyverno mounts agent.py from the zerotrust-sidecar-configs ConfigMap over /app/agent.py, the running code comes from the ConfigMap, not the image. Updating the agent therefore requires updating the ConfigMap, not rebuilding the image — the image only needs didkit and requests present:
 
 ```bash
 kubectl get configmap zerotrust-sidecar-configs -n ricxapp -o json > /tmp/cm.json
@@ -2469,12 +2285,77 @@ kubectl apply -f /tmp/cm-updated.json
 # Confirm the new code landed
 kubectl get configmap zerotrust-sidecar-configs -n ricxapp \
   -o jsonpath='{.data.agent\.py}' | grep -c "prove_identity"
-```
-## Kyverno Update
-The inject-sidecars rule from Phase 6 gains one environment variable on the auth-agent container. Everything else in the policy is unchanged:
+``` -->
 
-```bash
-- name: auth-agent
+# Phase 10: Apply Kyverno Automation
+Kyverno's mutation rule from the Localized PEP approach (`Main-Implementation.md`) is extended to also mount each xApp's `xapp-wallet-<name>` Secret into the Auth Agent container at `/wallet`, and to inject the trusted `RIC_DID` from the `ric-vc-config` ConfigMap so the agent knows what issuer DID to trust without a code change.
+
+The inject-sidecars rule from Phase 6 gains one environment variable on the auth-agent container. Everything else in the policy is unchanged:
+Create file `touchless-security.yaml`:
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: touchless-xapp-security
+spec:
+  admission: true
+  background: true
+  validationFailureAction: Audit
+  rules:
+  - name: generate-tls-cert
+    match:
+      any:
+      - resources:
+          kinds:
+          - Deployment
+          namespaces:
+          - ricxapp
+    generate:
+      apiVersion: cert-manager.io/v1
+      kind: Certificate
+      name: "{{request.object.metadata.name}}-cert"
+      namespace: ricxapp
+      synchronize: true
+      data:
+        spec:
+          secretName: "{{request.object.metadata.name}}-certs"
+          commonName: "{{request.object.metadata.name}}"
+          issuerRef:
+            name: smo-root-ca
+            kind: ClusterIssuer
+
+  - name: inject-sidecars
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          namespaces:
+          - ricxapp
+    mutate:
+      patchStrategicMerge:
+        spec:
+          containers:
+          - (name): "?*"
+            env:
+            - name: DBAAS_SERVICE_HOST
+              value: "127.0.0.1"
+            - name: DBAAS_SERVICE_PORT
+              value: "6379"
+
+          - name: envoy-proxy
+            image: envoyproxy/envoy:v1.28.0
+            volumeMounts:
+            - name: sidecar-configs
+              mountPath: /etc/envoy/envoy.yaml
+              subPath: envoy.yaml
+            # [NEW] Mount the WASM filter into Envoy
+            - name: wasm-filter-volume
+              mountPath: /etc/envoy/wasm/
+            - name: xapp-tls-volume
+              mountPath: /etc/xapp-certs
+              readOnly: true
+          - name: auth-agent
             image: ashank2001/auth-agent:did-vc-v3
             imagePullPolicy: Always
             env:
@@ -2491,7 +2372,38 @@ The inject-sidecars rule from Phase 6 gains one environment variable on the auth
                 configMapKeyRef:
                   name: ric-vc-config
                   key: RIC_DID
+            volumeMounts:
+            - name: xapp-tls-volume
+              mountPath: /etc/xapp-certs
+              readOnly: true
+            - name: xapp-wallet
+              mountPath: /wallet
+              readOnly: true
+
+          volumes:
+          - name: sidecar-configs
+            configMap:
+              name: zerotrust-sidecar-configs
+          - name: xapp-tls-volume
+            secret:
+              secretName: "{{request.object.metadata.labels.app}}-certs"
+          - name: xapp-wallet
+            secret:
+              secretName: "xapp-wallet-{{request.object.metadata.labels.app}}"
+          # [NEW] Define the volume from the ConfigMap we just created
+          - name: wasm-filter-volume
+            configMap:
+              name: redis-wasm-filter
+
 ```
+
+```bash
+sudo kubectl apply -f touchless-security.yaml
+```
+
+Note: Kyverno's `generate` rule for Certificates runs unconditionally on every `Deployment` in `ricxapp`, but the `xapp-wallet-<name>` Secret referenced by the `inject-sidecars` rule must already exist (it is created by the provisioner in Phase 8) **before** the xApp pod is scheduled — otherwise the pod stays in `ContainerCreating` waiting on a missing Secret volume.
+
+
 Two operational notes:
 
 ric-vc-config lives in ricplt, but ConfigMaps are namespace-scoped and the xApp pod runs in ricxapp. The RIC_DID reference above will leave the pod in CreateContainerConfigError unless the ConfigMap is also present in ricxapp. Either copy it, or omit the RIC_DID block and let the agent fall back to its compiled-in default:
@@ -2531,6 +2443,215 @@ kubectl logs -n ricxapp $POD -c auth-agent -f
 kubectl logs -n ricplt deployment/vp-verifier -f
 ```
 
-## Security Properties After Phase 9
+
+
+## Security Properties After Phase 10
 The verifier holds no xApp private key, so a valid VP proof demonstrates that the presenter controls the key bound to credentialSubject.id — this is a genuine proof of possession rather than a self-attestation. The nonce is generated by the verifier, is single-use, and expires after a bounded TTL, so a captured presentation cannot be replayed. Holder binding is checked explicitly: the VP's verificationMethod must belong to the credential subject, which prevents an attacker presenting a credential issued to a different 
 xApp. The credential signature is re-verified by the verifier rather than taken on trust from the agent, and the authorization claims forwarded to OPA are produced by the verifier, so a compromised agent cannot inflate its own permissions.
+
+
+# Phase 11: Secure xApp Onboarding Script
+
+`secure_xapp_onboard.sh` ties Phase 8 provisioning into the same `dms_cli` onboarding flow described in `xapp-onboarding.md`, so a single command builds the xApp image, onboards it via DMS CLI, provisions its DID/VC wallet **before** the pod is created, then installs the xApp and verifies the wallet actually landed inside the Auth Agent sidecar.
+
+Create `secure_xapp_onboard.sh`:
+```bash
+#!/bin/bash
+
+set -e
+
+# Usage:
+# ./secure_xapp_onboard.sh <repo-path> <descriptor-path> <xapp-name> <version> <namespace> <allowed-namespaces> <permissions>
+#
+# Example:
+# ./secure_xapp_onboard.sh ~/custom-sdl-xapp ~/custom-sdl-xapp/descriptor sdl-xapp 1.0.1 ricxapp ue-metrics read,write
+
+REPO_PATH=$1
+DESC_PATH=$2
+XAPP_CHART_NAME=$3
+VERSION=$4
+NAMESPACE=$5
+ALLOWED_NAMESPACES=$6
+PERMISSIONS=$7
+
+if [ -z "$REPO_PATH" ] || [ -z "$DESC_PATH" ] || [ -z "$XAPP_CHART_NAME" ] || [ -z "$VERSION" ] || [ -z "$NAMESPACE" ] || [ -z "$ALLOWED_NAMESPACES" ] || [ -z "$PERMISSIONS" ]; then
+  echo "Usage:"
+  echo "./secure_xapp_onboard.sh <repo-path> <descriptor-path> <xapp-name> <version> <namespace> <allowed-namespaces> <permissions>"
+  echo
+  echo "Example:"
+  echo "./secure_xapp_onboard.sh ~/custom-sdl-xapp ~/custom-sdl-xapp/descriptor sdl-xapp 1.0.1 ricxapp ue-metrics read,write"
+  exit 1
+fi
+
+RUNTIME_XAPP_NAME="${NAMESPACE}-${XAPP_CHART_NAME}"
+IMAGE_NAME="127.0.0.1:5000/${XAPP_CHART_NAME}:${VERSION}"
+
+echo "======================================================"
+echo "[0] Secure DID/VC xApp onboarding"
+echo "Chart xApp name   : $XAPP_CHART_NAME"
+echo "Runtime xApp name : $RUNTIME_XAPP_NAME"
+echo "Version           : $VERSION"
+echo "Namespace         : $NAMESPACE"
+echo "Image             : $IMAGE_NAME"
+echo "Allowed namespaces: $ALLOWED_NAMESPACES"
+echo "Permissions       : $PERMISSIONS"
+echo "======================================================"
+
+echo
+echo "[1] Building Docker image..."
+cd "$REPO_PATH"
+sudo docker build -t "$IMAGE_NAME" .
+
+echo
+echo "[2] Pushing Docker image..."
+sudo docker push "$IMAGE_NAME"
+
+echo
+echo "[3] Running dms_cli onboard..."
+cd "$DESC_PATH"
+CHART_REPO_URL=http://127.0.0.1:8090
+
+sudo CHART_REPO_URL=$CHART_REPO_URL dms_cli onboard \
+  --config_file_path=config-file.json \
+  --shcema_file_path=schema.json | tee /tmp/dms_onboard.log
+
+if grep -qiE "Cannot connect|Service not ready|error_message|Failed to connect" /tmp/dms_onboard.log; then
+  echo "[ERROR] dms_cli onboard failed. Fix local Helm chart repo before continuing."
+  exit 1
+fi
+echo
+
+echo
+echo "[4] Checking ACA-Py admin API..."
+if ! curl -fsS http://localhost:3001/status >/dev/null; then
+  echo "[ERROR] ACA-Py admin API is not reachable at localhost:3001"
+  echo
+  echo "Open another terminal and run:"
+  echo "sudo kubectl port-forward -n ricplt svc/acapy-ric-agent 3001:3001"
+  echo
+  echo "Then rerun this script."
+  exit 1
+fi
+
+echo "[5] Provisioning DID/VC wallet before xApp install..."
+cd ~/did-vc-setup/provisioner
+python3 provision_xapp_wallet.py "$RUNTIME_XAPP_NAME" "$ALLOWED_NAMESPACES" "$PERMISSIONS"
+
+echo
+echo "[6] Verifying wallet Secret..."
+sudo kubectl get secret "xapp-wallet-${RUNTIME_XAPP_NAME}" -n "$NAMESPACE"
+
+echo
+echo "[7] Skipping uninstall. This flow keeps existing xApps running."
+
+echo
+echo "[8] Installing xApp using dms_cli..."
+sudo CHART_REPO_URL=$CHART_REPO_URL dms_cli install "$XAPP_CHART_NAME" "$VERSION" "$NAMESPACE"
+
+echo
+echo "[9] Waiting for xApp pod to appear..."
+sleep 15
+
+POD=$(sudo kubectl get pods -n "$NAMESPACE" --sort-by=.metadata.creationTimestamp \
+  | grep "$RUNTIME_XAPP_NAME" | tail -n1 | awk '{print $1}')
+
+if [ -z "$POD" ]; then
+  echo "[ERROR] No pod found for $RUNTIME_XAPP_NAME"
+  sudo kubectl get pods -n "$NAMESPACE"
+  exit 1
+fi
+
+echo "Pod: $POD"
+
+echo
+echo "[10] Waiting for pod to become Ready..."
+sudo kubectl wait --for=condition=Ready pod/"$POD" -n "$NAMESPACE" --timeout=180s || true
+
+echo
+echo "[11] Showing pod status..."
+sudo kubectl get pod "$POD" -n "$NAMESPACE"
+
+echo
+echo "[12] Showing injected containers..."
+sudo kubectl get pod "$POD" -n "$NAMESPACE" \
+  -o jsonpath='{range .spec.containers[*]}{.name}{" -> "}{.image}{"\n"}{end}'
+
+echo
+echo "[13] Verifying wallet mount inside Auth-Agent..."
+sudo kubectl exec -n "$NAMESPACE" "$POD" -c auth-agent -- ls -l /wallet || {
+  echo "[ERROR] Auth-Agent or wallet mount not found. Kyverno injection may have failed."
+  exit 1
+}
+
+echo
+echo "[14] Showing Auth-Agent logs..."
+sudo kubectl logs -n "$NAMESPACE" "$POD" -c auth-agent --tail=80
+
+echo
+echo "[15] Showing xApp logs..."
+sudo kubectl logs -n "$NAMESPACE" "$POD" -c "$XAPP_CHART_NAME" --tail=80 || true
+
+echo
+echo "======================================================"
+echo "[+] Secure DID/VC onboarding completed"
+echo "Runtime xApp name: $RUNTIME_XAPP_NAME"
+echo "Wallet Secret    : xapp-wallet-${RUNTIME_XAPP_NAME}"
+echo "Pod              : $POD"
+echo "======================================================"
+```
+
+Run it end to end:
+```bash
+chmod +x secure_xapp_onboard.sh
+./secure_xapp_onboard.sh ~/custom-sdl-xapp ~/custom-sdl-xapp/descriptor sdl-xapp 1.0.1 ricxapp e2-metrics,kpi-store read,write
+```
+
+## Request Lifecycle & Traffic Flow
+
+1. **Onboarding (one-time, out-of-band):** the operator runs `secure_xapp_onboard.sh`, which provisions the xApp's sov DID, key DID, and signed VC, and stores them as the `xapp-wallet-<name>` Secret before the xApp pod is ever scheduled.
+2. **Injection:** Kyverno mutates the incoming xApp Pod, adding the Envoy sidecar, the Auth Agent v2 sidecar, and mounting the wallet Secret at `/wallet`.
+3. **Startup verification:** on boot, the Auth Agent loads the wallet and immediately verifies the VC's signature and issuer/RIC DID chain (`verify_vc_at_startup`). If this fails, every subsequent request is denied without contacting OPA.
+4. **Initiation:** the xApp executes an SDL command; Envoy's `ext_authz` filter intercepts the TCP connection and sends a `CheckRequest` to the Auth Agent over gRPC (`:50051`).
+5. **Claim extraction:** the Auth Agent extracts and expiry-checks the plain claims (`allowed_namespaces`, `permissions`) from the already-verified VC.
+6. **Proof of possession:** the Auth Agent constructs a fresh Verifiable Presentation over the VC, signs it with the xApp's private JWK, and verifies it with DIDKit — proving the sidecar actually holds the private key bound to the credential, not just a copy of the VC JSON.
+7. **Local pre-check:** a cheap local permission/namespace check runs before bothering OPA, to short-circuit obviously-denied requests.
+8. **ABAC decision:** the Auth Agent forwards plain verified claims (`x-vc-verified: true`, `x-permissions`, `x-allowed-namespaces`, `x-ric-sov-did`, ...) to OPA over gRPC; OPA evaluates the Rego policy from Phase 6 and returns allow/deny.
+9. **Enforcement:** the Auth Agent relays OPA's decision back to Envoy as the `CheckResponse`; Envoy either forwards the TCP connection to Redis or drops it.
+
+## Known Limitations / Testbed Decisions
+- Von Network runs on the Ubuntu host via Docker Compose, not inside Kubernetes — the native `von-network-k8s.yaml` deployment was abandoned after genesis file generation timing prevented the 4-node pool from reaching consensus.
+- DIDKit is used for VC signing instead of ACA-Py's built-in W3C credential endpoint, because ACA-Py 0.10.4 with the `askar` wallet type does not expose `/vc/credentials/issue`.
+- The RIC issuer keypair (`ric-issuer.json`) is generated fresh per provisioning setup by `create_ric_issuer.py`; in a production deployment this would be persisted permanently as the RIC's signing identity and rotated deliberately rather than regenerated.
+- `did:key` is used for the xApp's VP-signing DID, kept separate from its ledger-anchored `did:sov` identity — the sov DID proves ledger registration, the key DID proves possession at runtime.
+- Full DIDComm-based credential exchange (issuer-to-holder protocol messages) is not implemented; the signed VC is delivered out-of-band by writing it directly into the xApp's wallet Secret during provisioning.
+
+## Common commands
+
+Check ACA-Py, Von Network and OPA reachability:
+```bash
+curl -s http://localhost:3001/status | python3 -m json.tool
+curl -s http://<HOST_IP>:9000/status
+sudo kubectl port-forward deployment/opa-pdp 8181:8181 -n ricplt
+```
+
+Check logs in a specific container within a specific pod:
+```bash
+sudo kubectl logs ricxapp-sdl-xapp-686946b7-765hs -c auth-agent -n ricxapp
+```
+
+Check which agent.py code is actually running inside the sidecar:
+```bash
+sudo kubectl exec ricxapp-sdl-xapp-686946b7-5wn25 -c auth-agent -n ricxapp -- cat /app/agent.py
+```
+
+Inspect a wallet Secret's contents without decoding manually:
+```bash
+sudo kubectl get secret xapp-wallet-ricxapp-sdl-xapp -n ricxapp -o json \
+  | python3 -c "import sys,json,base64; d=json.load(sys.stdin)['data']; [print(k, '=>', base64.b64decode(v)[:200]) for k,v in d.items()]"
+```
+
+Re-provision a wallet after rotating permissions for an already-onboarded xApp:
+```bash
+python3 provision_xapp_wallet.py ricxapp-sdl-xapp e2-metrics,kpi-store,ue-metrics read,write
+sudo kubectl rollout restart deployment ricxapp-sdl-xapp -n ricxapp
+```

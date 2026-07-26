@@ -1,8 +1,12 @@
-# Download the latest stable release
+# Download the Kubernetes Metrics Server
+The Kubernetes Metrics Server was deployed to enable resource utilization monitoring within the Kubernetes cluster. It periodically collects CPU and memory usage statistics from kubelets and exposes these metrics through the Kubernetes Metrics API. These metrics are required for monitoring cluster health and evaluating the resource overhead introduced by the proposed Zero Trust framework.
 
+The latest Metrics Server deployment manifest was downloaded from the official Kubernetes repository:
 ```bash
 wget https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml -O metrics-server.yaml
 ```
+
+The deployment manifest was then modified before deployment. Specifically, the `--kubelet-insecure-tls` argument was added to the Metrics Server container configuration to start container without error:
 
 ```bash
 nano metrics-server.yaml
@@ -20,20 +24,34 @@ containers:
         image: registry.k8s.io/metrics-server/metrics-server:v0.7.2
         ...
 ```
+The --kubelet-insecure-tls option disables kubelet certificate verification when the Metrics Server communicates with worker nodes. This modification was necessary because the Kubernetes cluster used self-signed kubelet certificates that did not contain valid Subject Alternative Names (SANs), preventing successful TLS verification. Enabling this option allows the Metrics Server to securely retrieve resource metrics in the experimental environment.
+
+After updating the configuration, the Metrics Server was deployed using:
 
 ```bash
 sudo kubectl apply -f metrics-server.yaml
+
+```
+
+The deployment status was verified by monitoring the Metrics Server pod:
+```bash
 sudo kubectl get pods -n kube-system -w | grep metrics-server
+```
+
+Once the pod reached the `RUNNING 1/1` state, cluster resource utilization metrics were retrieved using:
+```bash
 sudo kubectl top nodes
 ```
 
+# Scale Up the Number of xApp Pods
 
 Scale up the pod by replication:
 ```bash
-sudo kubectl scale deployment ricxapp-sdl-xapp --replicas=10 -n ricxapp
+sudo kubectl scale deployment ricxapp-sdl-xapp --replicas=1 -n ricxapp
 ```
 
-`record_node_metrics.sh`
+
+Create `record_node_metrics.sh` to record CPU, Memory utilization with respect to time while replicating xApps:
 
 ```bash
 #!/bin/bash
@@ -75,8 +93,9 @@ Run it in seperate terminal:
 ```bash
 sudo ./record_node_metrics.sh
 ```
+Replicate xApp pods periodically. This script will save the metrices in csv file.
 
-# How to Increase the Pod Limit
+# How to Increase the Pod Limit in Kubernetes Cluster
 Assuming you built this cluster using kubeadm (standard for Ubuntu deployments), here is how you override the default limit to allow 250 pods.
 
 Step 1: Edit the Kubelet Configuration
