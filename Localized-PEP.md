@@ -1,5 +1,31 @@
-`smo-issuer.yaml`
+
+# Phase 1: Cert-Manager Setup & PKI Configuration
+
+In our Zero Trust O-RAN architecture, **cert-manager** acts as the automated Public Key Infrastructure (PKI) engine inside the Kubernetes cluster. It is responsible for dynamically minting, delivering, and managing X.509 Mutual TLS (mTLS) certificates for every xApp deployed in the RIC. 
+
+By integrating `cert-manager` with our Kyverno automation pipeline, we achieve a "Zero-Touch" identity provisioning system, completely decoupling security management from xApp development.
+
+## 2. Installation
+Cert-manager was deployed into the cluster using its standard Kubernetes manifests. This creates the necessary Custom Resource Definitions (CRDs) and the background controllers.
+
 ```bash
+# Create the cert-manager namespace and install the stack
+sudo kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.2/cert-manager.yaml
+```
+Wait until all pods are running. check pod status using this command.
+```bash
+sudo kubectl get pods -n cert-manager
+```
+
+create SMO root certificate as a kube secret within `cert-manager` namespace.
+```bash
+sudo kubectl create secret tls smo-root-ca-secret \
+  --cert=ca.crt \
+  --key=ca.key \
+  --namespace=cert-manager
+```
+Apply cluster issuer for issue xApp certificates via cert-manager. create `smo-issuer.yaml`:
+```yaml
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
 metadata:
@@ -9,9 +35,8 @@ spec:
     secretName: smo-root-ca-secret
 ```
 
-`kyverno-rbac.yaml`
-```bash
-
+Provide `cert-manager` access to Kyverno service. Create `kyverno-rbac.yaml`:
+```yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -45,6 +70,9 @@ roleRef:
   name: kyverno:generate-security-resources
   apiGroup: rbac.authorization.k8s.io
 ```
+
+
+# Implement WASM Network Filter to Parse Redis Payload
 
 This document outlines the steps to install the required toolchains, compile the WebAssembly (Wasm) Policy Enforcement Point (PEP) for Envoy, and deploy it to the O-RAN Shared Data Layer (DBaaS).
 
@@ -92,11 +120,6 @@ go version
 # Expected: go version go1.21.10 linux/amd64
 
 ```
-
-
-
----
-
 ## Step 2: Install TinyGo (v0.30.0)
 
 TinyGo is the specialized compiler required to output the `.wasm` format matching the `wasi` target that Envoy expects.
@@ -107,13 +130,11 @@ wget https://github.com/tinygo-org/tinygo/releases/download/v0.30.0/tinygo_0.30.
 
 ```
 
-
 2. **Install the package:**
 ```bash
 sudo dpkg -i tinygo_0.30.0_amd64.deb
 
 ```
-
 
 3. **Verify installation:**
 ```bash
@@ -122,9 +143,8 @@ tinygo version
 
 ```
 
-
 `main.go` older version. without shared memeory.
-```bash
+```go
 package main
 
 import (
@@ -289,8 +309,8 @@ func (ctx *redisAuthContext) opaCallback(numHeaders, bodySize, numTrailers int) 
 
 ```
 
-This is the updated main.go:
-```bash
+This is the updated `main.go` with the resolved shared memory problem:
+```go
 package main
 
 import (
@@ -492,9 +512,9 @@ sudo kubectl create configmap wasm-binary-config --from-file=auth-agent.wasm -n 
 sudo kubectl delete pod -l app=ricxapp-sdl-xapp -n ricxapp
 ```
 
-
-`zerotrust-sidecar-configs.yaml`
-```bash
+# Envoy Sidecar Configuration
+Envoy is used as Local PEP Sidecar and apply configMap to Envoy using `zerotrust-sidecar-configs.yaml`:
+```yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -535,6 +555,17 @@ data:
       - name: opa_cluster
         connect_timeout: 0.25s
         type: STRICT_DNS
+        lb_policy: LEAST_REQUEST       # Advanced L7 Client-Side Balancing
+        outlier_detection:
+          consecutive_5xx: 3
+          base_ejection_time: 10s
+          max_ejection_percent: 50
+        circuit_breakers:
+          thresholds:
+            - priority: DEFAULT
+              max_connections: 5000
+              max_pending_requests: 10000
+              max_requests: 10000
         load_assignment:
           cluster_name: opa_cluster
           endpoints:
@@ -581,9 +612,15 @@ data:
                 - certificate_chain: { filename: "/etc/xapp-certs/tls.crt" }
                   private_key: { filename: "/etc/xapp-certs/tls.key" }
 ```
-
-`dbaas-cert.yaml`
+Apply the config:
 ```bash
+sudo kubectl apply -f zerotrust-sidecar-configs.yaml
+```
+
+# DBaaS pod configurations to establish mTLS Tunnel
+
+Create SMO Root CA signed certificated for DBaaS. Create `dbaas-cert.yaml`:
+```yaml
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
@@ -607,8 +644,8 @@ spec:
     kind: ClusterIssuer
 ```
 
-`dbaas-sidecar-config.yaml`
-```bash
+Add Envoy sidecar with stored DBaaS certificate within DBaaS pod for establish mTLS tunnel. Create `dbaas-sidecar-config.yaml`:
+```yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -650,8 +687,8 @@ data:
             - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 6379 } } }
 ```
 
-`dbaas-patches.yaml`
-```bash
+Patch the StatefulSet for update DBaaS to add ingress Envoy Proxy. It is much easier and safer to patch the Deployment and the Service separately. Create two new files from your original snippet. Create `pod-patch.yaml`:
+```yaml
 # 1. StatefulSet Patch
 spec:
   template:
@@ -674,13 +711,34 @@ spec:
       - name: dbaas-certs
         secret:
           secretName: dbaas-server-certs
----
-# 2. Service Patch
+```
+
+Create `svc-patch.yaml`
+```yaml
 spec:
   ports:
   - port: 6379
     targetPort: 6380 # Redirect traffic to Envoy
 ```
+
+Run this command to find them:
+
+```bash
+sudo kubectl get deployment,statefulset,svc -n ricplt | grep dbaas
+```
+Take note of the exact names. For the examples below, I will assume they are named deployment/dbaas-server and service/dbaas-service.
+
+```Bash
+sudo kubectl patch deployment/dbaas-server -n ricplt --patch-file pod-patch.yaml
+```
+```bash
+sudo kubectl patch service/dbaas-service -n ricplt --patch-file svc-patch.yaml
+```
+**What happens next?**\
+As soon as you patch the Deployment/StatefulSet, Kubernetes will automatically terminate the old DBaaS pod and spin up a new one containing your dbaas-envoy-proxy sidecar. The Service patch will instantly reroute all incoming cluster traffic destined for port 6379 into the Envoy proxy's port 6380. Envoy will terminate the mTLS connection, verify the certificates, and then forward the raw traffic locally to the Redis container.
+
+
+## Apply Network Policy
 
 `dbaas-network-policy.yaml`
 
@@ -785,8 +843,8 @@ sudo kubectl get pods -n calico-system -w
 
 ## Apply Kyverno Automation
 
-`kyverno-automation.yaml`
-```bash
+Create `kyverno-automation.yaml`:
+```yaml
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -866,11 +924,15 @@ spec:
                 secretName: "{{request.object.metadata.labels.app}}-certs"
 ```
 
-
-
-`opa-policy.yaml`
-
 ```bash
+sudo kubectl apply -f kyverno-automation.yaml
+```
+
+# Apply Policies to OPA
+
+Create `opa-policy.yaml`:
+
+```yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -942,9 +1004,21 @@ data:
         is_signature_valid
     }
 ```
+```bash
+sudo kubectl apply -f opa-policy.yaml
+```
+
 ## Execution:
 Execute the following command to open a live stream inside the secured DBaaS environment. When the xApp successfully transmits data, the decrypted RESP payload will populate in standard output, confirming end-to-end authorization and delivery.
 
+# Verification of Traffic Flow
+
+Monitor the real-time traffic from Redis database using `redis-cli`
 ```bash
 sudo kubectl exec -it statefulset-ricplt-dbaas-server-0 -c container-ricplt-dbaas-redis -n ricplt -- redis-cli MONITOR
+```
+
+Save Redis logs to a text file.
+```bash
+sudo kubectl exec -it statefulset-ricplt-dbaas-server-0 -c container-ricplt-dbaas-redis -n ricplt -- redis-cli MONITOR | tee logs-250.txt
 ```
