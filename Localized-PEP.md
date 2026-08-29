@@ -1020,5 +1020,117 @@ sudo kubectl exec -it statefulset-ricplt-dbaas-server-0 -c container-ricplt-dbaa
 
 Save Redis logs to a text file.
 ```bash
-sudo kubectl exec -it statefulset-ricplt-dbaas-server-0 -c container-ricplt-dbaas-redis -n ricplt -- redis-cli MONITOR | tee logs-250.txt
+sudo kubectl exec -it statefulset-ricplt-dbaas-server-0 -c container-ricplt-dbaas-redis -n ricplt -- redis-cli MONITOR | tee logs-225.txt
+```
+
+For scalability testing with fixed OPA resource:
+
+```bash
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opa-pdp
+  namespace: ricplt
+  labels:
+    app: opa-pdp
+spec:
+  replicas: 2                  # Baseline high availability
+  selector:
+    matchLabels:
+      app: opa-pdp
+  template:
+    metadata:
+      labels:
+        app: opa-pdp
+    spec:
+      containers:
+      - name: opa
+        image: openpolicyagent/opa:latest-envoy
+        args:
+        - "run"
+        - "--server"
+        - "--addr=0.0.0.0:8181"
+        - "--diagnostic-addr=0.0.0.0:8282"
+        - "--set=plugins.envoy_ext_authz_grpc.addr=:9191"
+        - "--set=plugins.envoy_ext_authz_grpc.path=envoy/authz/allow"
+        - "--set=decision_logs.console=true"
+        - "/config/policy.rego"
+        ports:
+        - containerPort: 9191
+          name: grpc
+        - containerPort: 8181
+          name: http
+        - containerPort: 8282
+          name: diag
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8282
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+        volumeMounts:
+        - name: opa-policy-vol
+          mountPath: /config
+      volumes:
+      - name: opa-policy-vol
+        configMap:
+          name: opa-policy
+```
+```bash
+apiVersion: v1
+kind: Service
+metadata:
+  name: opa-service
+  namespace: ricplt
+spec:
+  clusterIP: None              # Headless service for pod IP discovery
+  selector:
+    app: opa-pdp
+  ports:
+  - name: grpc
+    port: 9191
+    protocol: TCP
+    targetPort: 9191
+  - name: http
+    port: 8181
+    protocol: TCP
+    targetPort: 8181
+```
+Since you have alreay configured opa-service, when you apply it you will get error. Follow this method:
+```bash
+# 1. Delete the existing service
+sudo kubectl delete svc opa-service -n ricplt
+
+# 2. Recreate it with your new headless configuration
+sudo kubectl apply -f opa-service.yaml
+```
+
+
+```bash
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: opa-pdp-scaler
+  namespace: ricplt
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: opa-pdp
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
 ```

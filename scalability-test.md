@@ -47,7 +47,7 @@ sudo kubectl top nodes
 
 Scale up the pod by replication:
 ```bash
-sudo kubectl scale deployment ricxapp-sdl-xapp --replicas=1 -n ricxapp
+sudo kubectl scale deployment ricxapp-sdl-xapp --replicas=10 -n ricxapp
 ```
 
 

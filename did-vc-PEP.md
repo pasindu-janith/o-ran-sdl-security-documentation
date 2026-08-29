@@ -2655,3 +2655,76 @@ Re-provision a wallet after rotating permissions for an already-onboarded xApp:
 python3 provision_xapp_wallet.py ricxapp-sdl-xapp e2-metrics,kpi-store,ue-metrics read,write
 sudo kubectl rollout restart deployment ricxapp-sdl-xapp -n ricxapp
 ```
+
+# Apply OPA Policy
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opa-policy
+  namespace: ricplt
+data:
+  policy.rego: |
+    package envoy.authz
+
+    import rego.v1
+
+    # 1. Default to DENY (Fail-Closed)
+    default allow := false
+
+    # 2. Hardcoded Configuration (Centralized Governance)
+    # xApp Name -> List of allowed namespaces
+    allowed_namespaces := {
+        "ricxapp-sdl-xapp": ["e2-metrics", "kpi-store", "ue-metrics"],
+        "ts-xapp": ["e2-metrics"],
+        "rx-xapp": ["kpi-store"]
+    }
+
+    # xApp Name -> Roles
+    xapp_roles := {
+        "ricxapp-sdl-xapp": ["writer"],
+        "ts-xapp": ["reader"],
+        "rx-xapp": ["admin"]
+    }
+
+    # Role -> Actions
+    role_permissions := {
+        "reader": ["GET", "EXISTS"],
+        "writer": ["GET", "SET", "DEL", "MGET", "MSET"],
+        "admin":  ["GET", "SET", "DEL", "FLUSHALL", "MGET"]
+    }
+
+    # 3. Main Authorization Logic
+    allow if {
+        # Verify the Auth Agent successfully validated the VC/DID
+        input.attributes.request.http.headers["x-vc-verified"] == "true"
+
+        # Extract inputs from headers sent by the Auth Agent
+        xapp_name := input.attributes.request.http.headers["x-app-name"]
+        action := input.attributes.request.http.headers["x-sdl-action"]
+        raw_key := input.attributes.request.http.headers["x-sdl-key"]
+
+        # 4. Parse Namespace (Safely handle Redis Hash Tags)
+        requested_ns := extract_namespace(raw_key)
+
+        # 5. Namespace Validation
+        allowed_list := allowed_namespaces[xapp_name]
+        allowed_list[_] == requested_ns
+
+        # 6. Role/Permission Validation
+        roles := xapp_roles[xapp_name]
+        role := roles[_]
+        perms := role_permissions[role]
+        perms[_] == action
+    }
+
+    # Helper to safely extract namespace from Redis Hash Tags
+    # e.g., "{ue-metrics},ue_12345_metrics" -> "ue-metrics"
+    extract_namespace(key) := ns if {
+        contains(key, "{")
+        contains(key, "}")
+        ns := split(split(key, "}")[0], "{")[1]
+    } else := "default"
+
+```
