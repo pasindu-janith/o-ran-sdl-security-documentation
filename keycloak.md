@@ -261,6 +261,8 @@ spec:
           value: "false"
         - name: KC_HOSTNAME_STRICT_HTTPS
           value: "false"
+        - name: KC_TRUSTSTORE_PATHS
+          value: "/etc/keycloak-ca/ca.crt"
         - name: KC_DB
           value: "postgres"
         - name: KC_DB_URL
@@ -383,6 +385,7 @@ Step 3 — Configure X.509 Certificate Authentication
 18.	Click Save.
 
 NOTE: The Subject DN field uses a regex pattern to match the certificate subject. The .* wildcards accommodate spaces that OpenSSL places around the = sign in distinguished names (e.g. CN = xapp-test vs CN=xapp-test).
+NOTE (Keycloak 26+): A second field called Certificate Authority subject DN appears below the Subject DN field in Keycloak 26. Leave this field completely empty. Do not enter .* or any value. In Keycloak 26 this field is parsed as an exact X.500 distinguished name, not a regex — entering .* causes an improperly specified input name crash and all token requests for that client will fail with Unexpected error when authenticating client.
 
 # 3.3 Verify Client Configuration via API
 Use the Keycloak Admin API to confirm the client is correctly configured:
@@ -414,6 +417,7 @@ Confirm these values in the response:
 Attribute	Expected Value
 clientAuthenticatorType	client-x509
 x509.subjectdn	.*CN=xapp-test.*
+x509.casubjectdn 	(empty — not present in response)
 x509.allow.regex.pattern.comparison	true
 serviceAccountsEnabled	true
 
